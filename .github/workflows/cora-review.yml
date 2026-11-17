@@ -1,0 +1,73 @@
+name: Cora AI Code Review
+
+on:
+  pull_request:
+    branches: [develop, main]
+    types: [opened, synchronize, ready_for_review, reopened]
+
+concurrency:
+  group: cora-review-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+jobs:
+  cora-review:
+    name: Cora Review
+    runs-on: ubuntu-latest
+    # Large diffs need ~16 min of review; keep the job limit generous.
+    timeout-minutes: 30
+    steps:
+      # A PR-supplied .cora.yaml could set provider.base_url; CORA_BASE_URL
+      # always takes precedence over project config, so the endpoint comes
+      # from the repository secrets or variables only.
+      - name: Require the review credentials
+        env:
+          CORA_API_KEY: ${{ secrets.CORA_API_KEY }}
+          CORA_BASE_URL: ${{ secrets.CORA_BASE_URL || vars.CORA_BASE_URL }}
+          CORA_MODEL: ${{ secrets.CORA_MODEL || vars.CORA_MODEL }}
+        run: |
+          # An empty value must fail the job: a skipped review is not a pass.
+          missing=0
+          for name in CORA_API_KEY CORA_BASE_URL CORA_MODEL; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is empty or missing. Cora Review cannot run, and that must not pass silently. See docs/repo-settings.md."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      # Show which endpoint and model the review runs on. The API key is never
+      # passed to this step. GitHub masks secret values in logs, so store
+      # CORA_BASE_URL and CORA_MODEL as repository VARIABLES to see them.
+      - name: Show the review endpoint and model
+        env:
+          BASE_URL: ${{ secrets.CORA_BASE_URL || vars.CORA_BASE_URL }}
+          MODEL: ${{ secrets.CORA_MODEL || vars.CORA_MODEL }}
+        run: |
+          # Endpoint without userinfo, query or fragment: scheme://host/path.
+          endpoint=$(printf '%s' "$BASE_URL" | sed -E 's|^([A-Za-z][A-Za-z0-9+.-]*://)([^/@]*@)?([^?#]*).*|\1\3|')
+          echo "Cora review endpoint: ${endpoint:-<not set>}"
+          echo "Cora review model:    ${MODEL:-<not set>}"
+          {
+            echo "### Cora review"
+            echo "- endpoint: \`${endpoint:-not set}\`"
+            echo "- model: \`${MODEL:-not set}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout PR head
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run Cora AI Code Review
+        uses: codecoradev/cora-review-action@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cora-api-key: ${{ secrets.CORA_API_KEY }}
+          cora-base-url: ${{ secrets.CORA_BASE_URL || vars.CORA_BASE_URL }}
+          cora-model: ${{ secrets.CORA_MODEL || vars.CORA_MODEL }}
