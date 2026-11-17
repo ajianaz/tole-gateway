@@ -1,0 +1,53 @@
+# Cora Code Review Configuration
+# See: https://github.com/codecoradev/cora-code
+#
+# Known false-positive categories are encoded here as rules. Extend a rule
+# instead of sprinkling inline ignores.
+
+# Review focus areas
+focus:
+  - security
+  - performance
+  - bugs
+
+# Custom rules / additional instructions for the reviewer
+rules:
+  - "The gateway is a thin client of the tole serve API. Fields named `token`, `api_key` or `webhook_secret` in config structs are runtime-populated from the config file or environment; they are never hardcoded secrets. A real hardcoded credential, or a secret that reaches a log line, an error message or a tool argument, is a finding; flag it."
+  - "Every chat that can send a message must have passed the allowlist or the one-time pairing check. A code path that reaches the tole API for an unauthorized chat is a real finding; flag it."
+  - "Approvals go only through tole's single gate. A path that auto-approves, caches an approval, or approves a Destructive tool from chat is a real finding; flag it. An unanswered approval is a denial."
+
+# Ignore patterns
+ignore:
+  files:
+    - "*.lock"
+    - "Cargo.lock"
+    - "target/"
+    - "CHANGELOG.md"
+    - "docs/**"
+  rules:
+    - "Hardcoded password or secret"
+    - "Command injection via exec/system with dynamic input"
+    - "SQL injection via string concatenation"
+
+# Files removed from the REVIEWED DIFF. They are never sent to the model and
+# never produce a finding, so changelog, docs and lockfile lines do not count
+# toward a PR's size. A review that did not cover the whole diff exits 1
+# (`fail_on_incomplete`, the default): the CI job fails visibly instead of
+# passing on a partial review.
+review:
+  exclude:
+    - "CHANGELOG.md"
+    - "docs/**"
+    - "*.lock"
+    - "Cargo.lock"
+
+# Hook settings
+hook:
+  mode: warn          # "warn" (print but allow) or "block" (fail commit)
+  min_severity: major # minimum severity to trigger hook action
+  max_diff_size: 5242880 # max 5MB diff chars before refusing
+
+# Output settings
+output:
+  format: pretty      # pretty, json, compact, sarif
+  color: true

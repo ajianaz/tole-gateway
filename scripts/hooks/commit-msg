@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# commit-msg hook: scan the commit message against the team message standard.
+#
+# The pattern is NOT stored in this repository. It is read from the
+# MESSAGE_STANDARD_PATTERN environment variable, or from the local git config
+# key `messagestandard.pattern` (set it once with
+# `git config --local messagestandard.pattern '<pattern>'`). The same pattern
+# is the repository variable MESSAGE_STANDARD_PATTERN that the CI
+# "Message Standard" job reads; CI is the gate, this hook only moves the
+# feedback to commit time.
+#
+# Install: scripts/setup-hooks.sh
+set -euo pipefail
+
+msg_file="${1:?commit-msg: message file argument missing}"
+
+pattern="${MESSAGE_STANDARD_PATTERN:-}"
+if [ -z "$pattern" ]; then
+  pattern="$(git config --get messagestandard.pattern 2>/dev/null || true)"
+fi
+
+if [ -z "$pattern" ]; then
+  echo "message-standard: pattern not configured locally, check skipped (CI still enforces it)" >&2
+  exit 0
+fi
+
+# Ignore the comment lines git adds to the editor template.
+body="$(grep -v '^#' "$msg_file" || true)"
+
+rc=0
+printf '%s\n' "$body" | grep -qiE -e "$pattern" || rc=$?
+case "$rc" in
+  0)
+    echo "message-standard: trailer not allowed (see team message standard)" >&2
+    exit 1
+    ;;
+  1) exit 0 ;;
+  *)
+    echo "message-standard: configured pattern is not a valid expression" >&2
+    exit 1
+    ;;
+esac
