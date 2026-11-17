@@ -1,0 +1,8 @@
+/target
+
+# cora review local artifacts
+.cora/
+
+# local configuration and secrets never belong in the repository
+.env
+*.local.toml

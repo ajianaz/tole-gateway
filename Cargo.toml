@@ -1,0 +1,13 @@
+[workspace]
+members = ["crates/tole-gateway"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.97"
+license = "Apache-2.0"
+repository = "https://github.com/ajianaz/tole-gateway"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
