@@ -1,0 +1,52 @@
+# tole-gateway configuration. Copy to a private location and edit.
+#
+# Secrets (bearer token, Basic password, bot token) should come from the
+# environment or from a file with mode 0600, not from this file.
+# Environment variables win over files, and files win over inline values:
+#   TOLE_SERVE_TOKEN, TOLE_SERVE_BASIC_USER, TOLE_SERVE_BASIC_PASSWORD,
+#   TOLE_GATEWAY_BOT_TOKEN
+
+# Where the gateway keeps its own state (the chat-to-session index).
+# Default: $XDG_STATE_HOME/tole-gateway, else ~/.local/state/tole-gateway.
+# state_dir = "/var/lib/tole-gateway"
+
+[tole]
+# Base URL of `tole serve`. It speaks plain HTTP: keep it on loopback.
+url = "http://127.0.0.1:7801"
+# Bearer token (prefer TOLE_SERVE_TOKEN or token_file).
+# token = "..."
+# File holding the bearer token; must be chmod 600.
+# token_file = "/etc/tole-gateway/serve.token"
+# Basic auth, only when serve runs with `--auth basic`. Use either the bearer
+# settings above or these, never both.
+# basic_user = "gateway"
+# basic_password = "..."
+# tole profile every chat session opens under: [a-z0-9_-]{1,64}.
+# profile = "telegram"
+# Working directory for new sessions; the serve workspace when unset.
+# cwd = "/home/me/project"
+# Timeout for ordinary requests, in seconds (> 0).
+request_timeout_secs = 30
+# Timeout for POST /prompt, which blocks for the whole turn (> 0).
+prompt_timeout_secs = 1800
+
+[telegram]
+# Bot token from BotFather (prefer TOLE_GATEWAY_BOT_TOKEN or bot_token_file).
+# bot_token = "123456:..."
+# File holding the bot token; must be chmod 600.
+# bot_token_file = "/etc/tole-gateway/bot.token"
+# Bot API base URL; change only for tests.
+api_base = "https://api.telegram.org"
+# Long-poll timeout in seconds (1 to 50).
+poll_timeout_secs = 30
+
+[auth]
+# Telegram user ids allowed to use the bot (positive integers).
+# An empty list is valid: the bot starts in pairing mode.
+allowed_user_ids = []
+# How long a pairing code stays valid, in seconds (at least 30).
+pairing_ttl_secs = 600
+
+[sessions]
+# Start a new session after this many hours without an owner message (>= 1).
+rollover_hours = 4
