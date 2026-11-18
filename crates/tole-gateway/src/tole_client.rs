@@ -93,7 +93,9 @@ pub trait ToleApi: Send + Sync {
 }
 
 /// Everything [`HttpToleClient`] needs.
-#[derive(Debug, Clone)]
+///
+/// `Debug` hides any `user:password@` part of `base_url`.
+#[derive(Clone)]
 pub struct ToleClientConfig {
     /// Base URL, for example `http://127.0.0.1:7801`.
     pub base_url: String,
@@ -103,6 +105,56 @@ pub struct ToleClientConfig {
     pub request_timeout: Duration,
     /// Timeout for `prompt`.
     pub prompt_timeout: Duration,
+}
+
+impl fmt::Debug for ToleClientConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToleClientConfig")
+            .field("base_url", &redact_url(&self.base_url))
+            .field("auth", &self.auth)
+            .field("request_timeout", &self.request_timeout)
+            .field("prompt_timeout", &self.prompt_timeout)
+            .finish()
+    }
+}
+
+/// Replace a `user:password@` (or `user@`) part of `url` with `***@`, so the
+/// result is safe to log. Text without userinfo is returned unchanged.
+pub fn redact_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let start = scheme_end + 3;
+    let rest = &url[start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{}***@{}", &url[..start], &rest[at + 1..]),
+        None => url.to_string(),
+    }
+}
+
+/// Largest response body read, in bytes. Normal answers are far smaller; an
+/// entries page is about 1 MiB at most.
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Longest id accepted in a URL path segment or query value.
+const MAX_ID_LEN: usize = 128;
+
+/// Check an id before it goes into a URL: non-empty, at most 128 characters,
+/// only `A-Za-z0-9_.-`, and not `.` or `..`.
+fn check_id(id: &str) -> Result<(), ToleError> {
+    let ok = !id.is_empty()
+        && id.len() <= MAX_ID_LEN
+        && id != "."
+        && id != ".."
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ToleError::BadRequest("invalid id".into()))
+    }
 }
 
 /// Longest server error text kept in a [`ToleError`], in characters.
@@ -138,6 +190,10 @@ struct Reply {
 
 impl HttpToleClient {
     /// Build a client from the configuration.
+    ///
+    /// The credential is sent on every request, so the caller must use an
+    /// `https` base URL, or `http` only to a loopback host. This constructor
+    /// does not enforce that; the config layer validates it.
     ///
     /// Fails with [`ToleError::BadRequest`] when the base URL is not an
     /// `http` or `https` URL, and [`ToleError::Transport`] when the HTTP
@@ -205,11 +261,9 @@ impl HttpToleClient {
         }
         let resp = req.send().await.map_err(map_reqwest_error)?;
         let status = resp.status();
-        let bytes = resp.bytes().await.map_err(map_reqwest_error)?;
+        let bytes = read_capped(resp).await?;
         if status.is_success() {
-            return Ok(Reply {
-                body: bytes.to_vec(),
-            });
+            return Ok(Reply { body: bytes });
         }
         Err(map_status(status, &bytes, busy_on_409))
     }
@@ -225,6 +279,26 @@ impl HttpToleClient {
         let reply = self.send(method, url, body, timeout, false).await?;
         decode(&reply.body)
     }
+}
+
+/// Read the whole body, failing with [`ToleError::Decode`] once it exceeds
+/// [`MAX_BODY_BYTES`]. Stops reading as soon as the cap is crossed.
+async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, ToleError> {
+    let too_big = || ToleError::Decode("the response body is too large".into());
+    if resp
+        .content_length()
+        .is_some_and(|n| n > MAX_BODY_BYTES as u64)
+    {
+        return Err(too_big());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(map_reqwest_error)? {
+        if body.len() + chunk.len() > MAX_BODY_BYTES {
+            return Err(too_big());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ToleError> {
@@ -324,6 +398,7 @@ impl ToleApi for HttpToleClient {
         session_id: &str,
         profile: Option<&str>,
     ) -> Result<SessionOpen, ToleError> {
+        check_id(session_id)?;
         let mut body = serde_json::Map::new();
         body.insert("resume".into(), json!(session_id));
         if let Some(profile) = profile {
@@ -340,6 +415,7 @@ impl ToleApi for HttpToleClient {
     }
 
     async fn prompt(&self, session_id: &str, text: &str) -> Result<PromptOutcome, ToleError> {
+        check_id(session_id)?;
         let url = self.url(&["sessions", session_id, "prompt"], &[]);
         let reply = self
             .send(
@@ -374,6 +450,7 @@ impl ToleApi for HttpToleClient {
     }
 
     async fn cancel(&self, session_id: &str) -> Result<(), ToleError> {
+        check_id(session_id)?;
         let url = self.url(&["sessions", session_id, "cancel"], &[]);
         self.send(Method::POST, url, None, self.request_timeout, false)
             .await
@@ -381,6 +458,7 @@ impl ToleApi for HttpToleClient {
     }
 
     async fn status(&self, session_id: &str) -> Result<SessionStatus, ToleError> {
+        check_id(session_id)?;
         let url = self.url(&["sessions", session_id, "status"], &[]);
         self.json(Method::GET, url, None, self.request_timeout)
             .await
@@ -391,6 +469,9 @@ impl ToleApi for HttpToleClient {
         struct List {
             #[serde(default)]
             approvals: Vec<ApprovalRow>,
+        }
+        if let Some(id) = session_id {
+            check_id(id)?;
         }
         let query: Vec<(&str, String)> = session_id
             .map(|s| vec![("session", s.to_string())])
@@ -407,6 +488,7 @@ impl ToleApi for HttpToleClient {
         approval_id: &str,
         decision: Decision,
     ) -> Result<DecisionAck, ToleError> {
+        check_id(approval_id)?;
         let url = self.url(&["approvals", approval_id, "decision"], &[]);
         self.json(
             Method::POST,
@@ -423,9 +505,64 @@ impl ToleApi for HttpToleClient {
         after: u64,
         limit: u32,
     ) -> Result<EntriesPage, ToleError> {
+        check_id(session_id)?;
         let query = [("after", after.to_string()), ("limit", limit.to_string())];
         let url = self.url(&["sessions", session_id, "entries"], &query);
         self.json(Method::GET, url, None, self.request_timeout)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_url_hides_userinfo() {
+        assert_eq!(
+            redact_url("http://user:pa55@host:7801/x"),
+            "http://***@host:7801/x"
+        );
+        assert_eq!(redact_url("https://tok@host"), "https://***@host");
+        assert_eq!(redact_url("http://u:p@w@host/p"), "http://***@host/p");
+        assert_eq!(
+            redact_url("http://127.0.0.1:7801/a@b"),
+            "http://127.0.0.1:7801/a@b"
+        );
+        assert_eq!(redact_url("not a url"), "not a url");
+    }
+
+    #[test]
+    fn config_debug_hides_userinfo() {
+        let cfg = ToleClientConfig {
+            base_url: "http://bob:hunter2@127.0.0.1:1".into(),
+            auth: ToleAuth::Bearer(crate::secret::Secret::new("TOK")),
+            request_timeout: Duration::from_secs(1),
+            prompt_timeout: Duration::from_secs(1),
+        };
+        let text = format!("{cfg:?}");
+        assert!(!text.contains("hunter2") && !text.contains("bob"), "{text}");
+        assert!(text.contains("***@127.0.0.1"), "{text}");
+    }
+
+    #[test]
+    fn check_id_rules() {
+        for ok in ["srv-1", "a.b_c-D9", "..a", "a..", &"x".repeat(128)] {
+            assert!(check_id(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a b",
+            "a?b",
+            "a#b",
+            "é",
+            "a%2f",
+            &"x".repeat(129),
+        ] {
+            assert!(check_id(bad).is_err(), "{bad}");
+        }
     }
 }

@@ -413,36 +413,33 @@ async fn ordinary_requests_use_the_request_timeout() {
 }
 
 #[tokio::test]
-async fn path_segments_and_query_values_are_percent_encoded() {
+async fn valid_ids_reach_the_server_in_path_and_query() {
     let (fake, client) = fake_with_token().await;
-    let weird = "we ird/id?x#y%z";
-    fake.add_session(weird);
-    fake.add_approval("ap/1 x", weird, "write_file", "d");
+    let id = "sess.1_a-B";
+    fake.add_session(id);
+    fake.add_approval("ap.1-x", id, "write_file", "d");
 
-    let st = client.status(weird).await.unwrap();
-    assert_eq!(st.id, weird);
+    let st = client.status(id).await.unwrap();
+    assert_eq!(st.id, id);
     let last = fake.last_request().unwrap();
-    assert_eq!(last.path, "/sessions/we%20ird%2Fid%3Fx%23y%25z/status");
+    assert_eq!(last.path, "/sessions/sess.1_a-B/status");
     assert_eq!(last.query, "");
 
-    client.entries(weird, 3, 4).await.unwrap();
+    client.entries(id, 3, 4).await.unwrap();
     assert_eq!(
         fake.last_request().unwrap().path,
-        "/sessions/we%20ird%2Fid%3Fx%23y%25z/entries"
+        "/sessions/sess.1_a-B/entries"
     );
 
-    let rows = client.approvals(Some(weird)).await.unwrap();
+    let rows = client.approvals(Some(id)).await.unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(
-        fake.last_request().unwrap().query,
-        "session=we+ird%2Fid%3Fx%23y%25z"
-    );
+    assert_eq!(fake.last_request().unwrap().query, "session=sess.1_a-B");
 
-    let ack = client.decide("ap/1 x", Decision::Deny).await.unwrap();
-    assert_eq!(ack.id, "ap/1 x");
+    let ack = client.decide("ap.1-x", Decision::Deny).await.unwrap();
+    assert_eq!(ack.id, "ap.1-x");
     assert_eq!(
         fake.last_request().unwrap().path,
-        "/approvals/ap%2F1%20x/decision"
+        "/approvals/ap.1-x/decision"
     );
 }
 
@@ -546,4 +543,76 @@ async fn the_fake_log_never_stores_the_secret() {
     let (fake, client) = fake_with_token().await;
     client.approvals(None).await.unwrap();
     assert!(!format!("{:?}", fake.requests()).contains(TOKEN));
+}
+
+#[tokio::test]
+async fn oversized_ok_body_is_a_decode_error() {
+    let (fake, client) = fake_with_token().await;
+    let big = format!(r#"{{"x":"{}"}}"#, "a".repeat(9 * 1024 * 1024));
+    fake.fail_with_body("GET", "/sessions/s/status", 200, &big);
+    let err = client.status("s").await.unwrap_err();
+    assert!(
+        matches!(err, ToleError::Decode(ref m) if m.contains("too large")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn oversized_error_body_is_a_decode_error() {
+    let (fake, client) = fake_with_token().await;
+    fake.fail_with_body(
+        "GET",
+        "/sessions/s/status",
+        500,
+        &"e".repeat(9 * 1024 * 1024),
+    );
+    let err = client.status("s").await.unwrap_err();
+    assert!(matches!(err, ToleError::Decode(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn bad_ids_are_rejected_without_calling_the_server() {
+    let (fake, client) = fake_with_token().await;
+    for bad in ["", ".", "..", "a/b", "a?b", &"x".repeat(129)] {
+        assert!(
+            matches!(client.status(bad).await, Err(ToleError::BadRequest(ref m)) if m == "invalid id"),
+            "{bad}"
+        );
+        assert!(matches!(
+            client.prompt(bad, "hi").await,
+            Err(ToleError::BadRequest(_))
+        ));
+        assert!(matches!(
+            client.cancel(bad).await,
+            Err(ToleError::BadRequest(_))
+        ));
+        assert!(matches!(
+            client.entries(bad, 0, 10).await,
+            Err(ToleError::BadRequest(_))
+        ));
+        assert!(matches!(
+            client.approvals(Some(bad)).await,
+            Err(ToleError::BadRequest(_))
+        ));
+        assert!(matches!(
+            client.decide(bad, Decision::Allow).await,
+            Err(ToleError::BadRequest(_))
+        ));
+        assert!(matches!(
+            client.resume_session(bad, None).await,
+            Err(ToleError::BadRequest(_))
+        ));
+    }
+    assert!(fake.requests().is_empty());
+}
+
+#[test]
+fn config_debug_never_shows_url_credentials() {
+    let cfg = config("http://bob:hunter2@127.0.0.1:7801", bearer());
+    let text = format!("{cfg:?}");
+    assert!(!text.contains("hunter2") && !text.contains(TOKEN), "{text}");
+    assert_eq!(
+        tole_gateway::tole_client::redact_url("http://bob:hunter2@h:1"),
+        "http://***@h:1"
+    );
 }
