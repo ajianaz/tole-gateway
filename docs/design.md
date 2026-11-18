@@ -1,7 +1,8 @@
 # tole-gateway design
 
-Status: G1 (bootstrap) in progress. This file records decisions and the
-roadmap; update it in the same PR that changes either.
+Status: the Telegram path (G2 and G3) is implemented and tested against fakes;
+not yet run against the real Telegram service. This file records decisions and
+the roadmap; update it in the same PR that changes either.
 
 ## 1. What it is
 
@@ -28,8 +29,9 @@ logic. Sessions, tools, approvals, budgets and storage stay in tole.
 
 ### Approvals
 
-- A pending approval is shown as inline buttons with the tool, the risk tier
-  and the redacted arguments.
+- A pending approval is shown as inline buttons with the tool and the one-line
+  redacted description from tole. The approval row carries no risk field: over
+  serve only Write-tier tools can be queued, so the message says so.
 - An unanswered approval is a denial.
 - Destructive tools are never approvable from chat. tole enforces this; the
   gateway offers no way around it.
@@ -56,8 +58,10 @@ logic. Sessions, tools, approvals, budgets and storage stay in tole.
   [codecoradev/tole#911](https://github.com/codecoradev/tole/issues/911)). The
   gateway therefore holds no SSE stream per session; the server caps streams at
   8.
-- Until that exists, the gateway polls `GET /approvals?session=` after every
-  allow and `GET /cron/runs`.
+- Until that exists, the gateway polls `GET /approvals?session=` and
+  `GET /sessions/{id}/status` after every allow, then reads the new log entries
+  for the answer (a resumed turn has no HTTP response). Polling `GET /cron/runs`
+  is not implemented yet.
 - Incoming deliveries are verified (signature and freshness) before anything
   is shown.
 
@@ -89,8 +93,28 @@ the binary.
 
 | Step | Scope | State |
 |------|-------|-------|
-| G1 | Repository bootstrap: workspace skeleton, CI and governance checks, docs. | in progress |
-| G2 | Telegram adapter: long polling, allowlist and pairing, one chat = one session, `/new`, 4-hour rollover. | planned |
-| G3 | Approvals from chat: inline buttons, denial on timeout, polling fallback. | planned |
+| G1 | Repository bootstrap: workspace skeleton, CI and governance checks, docs. | done |
+| G2 | Telegram adapter: long polling, allowlist and pairing, one chat = one session, `/new`, 4-hour rollover. | implemented, tested against fakes; live Telegram check pending |
+| G3 | Approvals from chat: inline buttons, denial on timeout, polling fallback. | implemented, tested against fakes |
 | G4 | Cron results and notifications through the signed webhook delivery target; second channel (Discord) and the adapter seam extraction. | planned |
 | G5 | Web dashboard. | later |
+
+## Known limitations
+
+- Events of one `getUpdates` batch run on separate tasks, so the order in which
+  messages of one chat are handled is not guaranteed (for example `/new`
+  followed by a prompt). Serializing per chat would block `/cancel` behind a
+  running turn, so it is not done. The per-chat busy gate keeps this safe (one
+  turn at a time, a pending approval blocks new work); only strict ordering is
+  lost.
+- If tole fails to write its audit record after it marked an approval approved,
+  it answers 500 before any resume starts. The gateway reads the row back as
+  approved, watches the session, and ends with "finished without a text
+  answer" although nothing ran. The action did not execute, so this is
+  harmless; the message is imprecise.
+- The per-chat busy flag is a plain boolean, not a counter. A button press that
+  lands in the instant a prompt is being shown can clear the flag a moment
+  early; the pending-approval check still blocks new work, and tole refuses a
+  second turn on a busy session.
+- Approval rows carry no risk field and only Write-tier tools can be queued over
+  serve, so the message says so instead of showing a tier.
