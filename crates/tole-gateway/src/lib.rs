@@ -16,6 +16,7 @@
 //! | [`sessions`] | Chat-to-session index and the rollover rule. |
 //! | [`approvals`] | Approval rows to buttons; answers to decisions. |
 //! | [`app`] | The dispatcher that wires everything together. |
+//! | [`runtime`] | Startup: load config, build clients, run the app. |
 
 #![forbid(unsafe_code)]
 
@@ -25,6 +26,7 @@ pub mod auth;
 pub mod channel;
 pub mod config;
 pub mod error;
+pub mod runtime;
 pub mod secret;
 pub mod sessions;
 pub mod telegram;

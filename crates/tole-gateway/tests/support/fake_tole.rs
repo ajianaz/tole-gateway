@@ -213,10 +213,15 @@ impl FakeTole {
 
     /// Add a pending approval and return its row.
     pub fn add_approval(&self, id: &str, session: &str, tool: &str, description: &str) -> Value {
+        // Stamped with the current time, as tole does when it queues the row.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         let row = json!({
             "id": id, "sessionId": session, "tool": tool,
             "description": description, "status": "pending",
-            "createdAtMs": 1_787_807_227_226u64, "expiresInSeconds": 900
+            "createdAtMs": now_ms, "expiresInSeconds": 900
         });
         self.with(|s| s.approvals.push(row.clone()));
         row
