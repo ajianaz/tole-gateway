@@ -72,9 +72,10 @@ pub enum ConfigError {
         /// A message with any offending value removed.
         message: String,
     },
-    /// A token file is readable by group or others.
+    /// A secret file, or a config file holding inline secrets, is readable
+    /// by group or others.
     #[error(
-        "token file {} has mode {mode:03o}; it must not be readable by group or others (run: chmod 600 {})",
+        "file {} has mode {mode:03o}; it must not be readable by group or others (run: chmod 600 {})",
         path.display(), path.display()
     )]
     InsecurePermissions {
@@ -270,19 +271,24 @@ impl Config {
     /// Load with an injected environment lookup. The environment is not
     /// needed to parse the file; it is accepted so callers use one signature.
     pub fn load_with_env(path: &Path, _env: EnvFn<'_>) -> Result<Config, ConfigError> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ConfigError::NotFound(path.to_path_buf()))
-            }
-            Err(e) => {
-                return Err(ConfigError::Read {
+        let (text, mode) = read_config_file(path)?;
+        let cfg = toml::from_str::<Config>(&text).map_err(|e| parse_error(path, &text, &e))?;
+        if let Some(mode) = mode {
+            if cfg.has_inline_secret() && mode & 0o077 != 0 {
+                return Err(ConfigError::InsecurePermissions {
                     path: path.to_path_buf(),
-                    reason: e.kind().to_string(),
-                })
+                    mode,
+                });
             }
-        };
-        toml::from_str::<Config>(&text).map_err(|e| parse_error(path, &text, &e))
+        }
+        Ok(cfg)
+    }
+
+    /// True when the file itself carries a secret value.
+    fn has_inline_secret(&self) -> bool {
+        self.tole.token.is_some()
+            || self.tole.basic_password.is_some()
+            || self.telegram.bot_token.is_some()
     }
 
     /// Resolve how to authenticate to `tole serve`. Exactly one scheme
@@ -299,7 +305,9 @@ impl Config {
             None
         };
 
-        let user = env_value(env, ENV_TOLE_BASIC_USER).or_else(|| t.basic_user.clone());
+        let user = env_value(env, ENV_TOLE_BASIC_USER)
+            .or_else(|| t.basic_user.clone())
+            .map(|u| u.trim().to_string());
         let password = env_value(env, ENV_TOLE_BASIC_PASSWORD)
             .map(Secret::new)
             .or_else(|| t.basic_password.clone());
@@ -359,8 +367,8 @@ impl Config {
     /// is valid (pairing mode).
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut p: Vec<String> = Vec::new();
-        if !is_http_url(&self.tole.url) {
-            p.push("tole.url must be an http:// or https:// URL with a host".into());
+        if let Some(m) = url_problem("tole.url", &self.tole.url) {
+            p.push(m);
         }
         if self.tole.request_timeout_secs == 0 {
             p.push("tole.request_timeout_secs must be greater than 0".into());
@@ -373,8 +381,8 @@ impl Config {
                 p.push("tole.profile must match [a-z0-9_-]{1,64}".into());
             }
         }
-        if !is_http_url(&self.telegram.api_base) {
-            p.push("telegram.api_base must be an http:// or https:// URL with a host".into());
+        if let Some(m) = url_problem("telegram.api_base", &self.telegram.api_base) {
+            p.push(m);
         }
         if !(1..=50).contains(&self.telegram.poll_timeout_secs) {
             p.push("telegram.poll_timeout_secs must be between 1 and 50".into());
@@ -422,20 +430,71 @@ fn env_value(env: EnvFn<'_>, key: &str) -> Option<String> {
 }
 
 fn nonblank(s: Secret, what: &str) -> Result<Secret, ConfigError> {
-    if s.is_blank() {
+    let trimmed = s.expose().trim();
+    if trimmed.is_empty() {
         Err(ConfigError::Blank {
             what: what.to_string(),
         })
-    } else {
+    } else if trimmed.len() == s.expose().len() {
         Ok(s)
+    } else {
+        Ok(Secret::new(trimmed))
     }
 }
 
+/// Maximum size of a secret file.
+const MAX_SECRET_FILE_BYTES: u64 = 4096;
+
+/// Read the config file through one open handle. Returns the text and, on
+/// unix, the permission bits of that same handle.
+fn read_config_file(path: &Path) -> Result<(String, Option<u32>), ConfigError> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| file_error(path, &e))?;
+    let meta = file.metadata().map_err(|e| file_error(path, &e))?;
+    if !meta.is_file() {
+        return Err(read_reason(path, "not a regular file"));
+    }
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        Some(meta.permissions().mode() & 0o777)
+    };
+    #[cfg(not(unix))]
+    let mode = None;
+    let mut text = String::new();
+    file.take(1024 * 1024)
+        .read_to_string(&mut text)
+        .map_err(|e| file_error(path, &e))?;
+    Ok((text, mode))
+}
+
+fn read_reason(path: &Path, reason: &str) -> ConfigError {
+    ConfigError::Read {
+        path: path.to_path_buf(),
+        reason: reason.to_string(),
+    }
+}
+
+/// Uid of the running process, read from the owner of `/proc/self` (no
+/// `unsafe`, no dependency). `None` when it cannot be determined, in which
+/// case the ownership check is skipped.
+#[cfg(unix)]
+fn current_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").ok().map(|m| m.uid())
+}
+
 fn read_secret_file(path: &Path, what: &str) -> Result<Secret, ConfigError> {
+    use std::io::Read;
+    // Open once; every check below describes the very file that is read.
+    let file = std::fs::File::open(path).map_err(|e| file_error(path, &e))?;
+    let meta = file.metadata().map_err(|e| file_error(path, &e))?;
+    if !meta.is_file() {
+        return Err(read_reason(path, "not a regular file"));
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(path).map_err(|e| file_error(path, &e))?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let mode = meta.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
             return Err(ConfigError::InsecurePermissions {
@@ -443,13 +502,22 @@ fn read_secret_file(path: &Path, what: &str) -> Result<Secret, ConfigError> {
                 mode,
             });
         }
+        // If the process uid cannot be determined, the owner check is skipped.
+        if let Some(uid) = current_uid() {
+            if meta.uid() != uid {
+                return Err(read_reason(path, "owned by another user"));
+            }
+        }
     }
-    let raw = std::fs::read_to_string(path).map_err(|e| file_error(path, &e))?;
-    let trimmed = raw.trim_end_matches(['\n', '\r']);
-    nonblank(
-        Secret::new(trimmed),
-        &format!("{what} ({})", path.display()),
-    )
+    let mut buf = Vec::new();
+    file.take(MAX_SECRET_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| file_error(path, &e))?;
+    if buf.len() as u64 > MAX_SECRET_FILE_BYTES {
+        return Err(read_reason(path, "file is larger than 4 KiB"));
+    }
+    let raw = String::from_utf8(buf).map_err(|_| read_reason(path, "not valid UTF-8"))?;
+    nonblank(Secret::new(raw), &format!("{what} ({})", path.display()))
 }
 
 fn file_error(path: &Path, e: &std::io::Error) -> ConfigError {
@@ -491,17 +559,50 @@ fn parse_error(path: &Path, text: &str, e: &toml::de::Error) -> ConfigError {
     }
 }
 
-fn is_http_url(u: &str) -> bool {
-    let rest = u
-        .strip_prefix("http://")
-        .or_else(|| u.strip_prefix("https://"));
-    match rest {
-        Some(r) => {
-            let host = r.split(['/', '?', '#']).next().unwrap_or("");
-            !host.is_empty() && !u.chars().any(char::is_whitespace)
-        }
-        None => false,
+/// Why `u` is not an acceptable service URL, or `None` when it is. The
+/// message never echoes the URL, which may carry credentials.
+fn url_problem(key: &str, u: &str) -> Option<String> {
+    use reqwest::Url;
+    let bad = || {
+        Some(format!(
+            "{key} must be an http:// or https:// URL with a host"
+        ))
+    };
+    if u.chars().any(char::is_whitespace) {
+        return bad();
     }
+    let Ok(url) = Url::parse(u) else {
+        return bad();
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return bad();
+    }
+    let Some(host) = url.host_str().filter(|h| !h.is_empty()) else {
+        return bad();
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return Some(format!(
+            "{key} must not contain a user name or password; \
+             use the token keys (token, token_file, basic_user, basic_password, \
+             bot_token, bot_token_file) or the environment variables instead"
+        ));
+    }
+    if url.scheme() == "http" && !is_loopback(host) {
+        return Some(format!(
+            "{key} uses plain http:// to a non-loopback host, which would send \
+             credentials in clear text; use https:// or keep the service on loopback"
+        ));
+    }
+    None
+}
+
+fn is_loopback(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    bare.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn valid_profile_name(n: &str) -> bool {
@@ -768,6 +869,184 @@ mod tests {
             PathBuf::from("/h/.local/state/tole-gateway")
         );
         assert!(c.state_dir(&env_of(&[])).is_err());
+    }
+
+    fn problems(text: &str) -> Vec<String> {
+        match cfg(text).validate() {
+            Err(ConfigError::Invalid(p)) => p,
+            Ok(()) => vec![],
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn urls_with_userinfo_or_no_host_are_rejected_without_echo() {
+        for u in [
+            "http://user:PWSECRET@127.0.0.1:7801",
+            "https://tok@example.com",
+        ] {
+            let p = problems(&format!("[tole]\nurl = \"{u}\"\n"));
+            assert_eq!(p.len(), 1, "{p:?}");
+            assert!(p[0].contains("token"), "{p:?}");
+            assert!(
+                !p[0].contains("PWSECRET") && !p[0].contains("tok@"),
+                "{p:?}"
+            );
+            let p = problems(&format!("[telegram]\napi_base = \"{u}\"\n"));
+            assert_eq!(p.len(), 1, "{p:?}");
+        }
+        for u in ["http://:80", "http://@/", "https://"] {
+            assert_eq!(
+                problems(&format!("[tole]\nurl = \"{u}\"\n")).len(),
+                1,
+                "{u}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_http_is_only_allowed_on_loopback() {
+        for u in [
+            "http://localhost:7801",
+            "http://127.0.0.1:7801",
+            "http://127.5.6.7",
+            "http://[::1]:7801",
+            "https://10.0.0.5:7801",
+            "https://example.com",
+        ] {
+            assert!(
+                problems(&format!("[tole]\nurl = \"{u}\"\n")).is_empty(),
+                "{u}"
+            );
+            assert!(
+                problems(&format!("[telegram]\napi_base = \"{u}\"\n")).is_empty(),
+                "{u}"
+            );
+        }
+        for u in [
+            "http://10.0.0.5:7801",
+            "http://example.com",
+            "http://[2001:db8::1]",
+        ] {
+            let p = problems(&format!("[tole]\nurl = \"{u}\"\n"));
+            assert_eq!(p.len(), 1, "{u}");
+            assert!(p[0].contains("https"), "{p:?}");
+            let p = problems(&format!("[telegram]\napi_base = \"{u}\"\n"));
+            assert_eq!(p.len(), 1, "{u}");
+        }
+    }
+
+    #[test]
+    fn token_files_must_be_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = cfg(&format!(
+            "[telegram]\nbot_token_file = \"{}\"\n",
+            dir.path().display()
+        ));
+        let e = c.bot_token(&env_of(&[])).unwrap_err();
+        assert!(e.to_string().contains("not a regular file"), "{e}");
+        let c = cfg("[telegram]\nbot_token_file = \"/dev/null\"\n");
+        let e = c.bot_token(&env_of(&[])).unwrap_err();
+        assert!(e.to_string().contains("not a regular file"), "{e}");
+    }
+
+    #[test]
+    fn token_files_are_size_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = token_file(&dir, "ok", &"a".repeat(4096), 0o600);
+        let big = token_file(&dir, "big", &"a".repeat(4097), 0o600);
+        let at = |p: &PathBuf| {
+            cfg(&format!(
+                "[telegram]\nbot_token_file = \"{}\"\n",
+                p.display()
+            ))
+            .bot_token(&env_of(&[]))
+        };
+        assert!(at(&ok).is_ok());
+        let e = at(&big).unwrap_err().to_string();
+        assert!(e.contains("larger than 4 KiB"), "{e}");
+    }
+
+    #[test]
+    fn token_files_owned_by_another_user_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = token_file(&dir, "t", "secret", 0o600);
+        let me = current_uid().expect("uid");
+        if std::os::unix::fs::chown(&f, Some(me.wrapping_add(1)), None).is_err() {
+            return; // not allowed to chown (not root); nothing to test
+        }
+        let c = cfg(&format!(
+            "[telegram]\nbot_token_file = \"{}\"\n",
+            f.display()
+        ));
+        let e = c.bot_token(&env_of(&[])).unwrap_err().to_string();
+        assert!(e.contains("owned by another user"), "{e}");
+    }
+
+    fn write_cfg(dir: &tempfile::TempDir, body: &str, mode: u32) -> PathBuf {
+        token_file(dir, "gateway.toml", body, mode)
+    }
+
+    #[test]
+    fn config_with_inline_secrets_must_not_be_group_or_world_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        for body in [
+            "[telegram]\nbot_token = \"123:SECRETVALUE\"\n",
+            "[tole]\ntoken = \"SECRETVALUE\"\n",
+            "[tole]\nbasic_user = \"u\"\nbasic_password = \"SECRETVALUE\"\n",
+        ] {
+            let p = write_cfg(&dir, body, 0o644);
+            let e = Config::load(&p).unwrap_err();
+            assert!(
+                matches!(e, ConfigError::InsecurePermissions { .. }),
+                "{body}"
+            );
+            let msg = e.to_string();
+            assert!(
+                msg.contains("chmod 600") && !msg.contains("SECRETVALUE"),
+                "{msg}"
+            );
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+            Config::load(&p).unwrap();
+        }
+        // No inline secret: unrestricted.
+        let p = write_cfg(&dir, "[sessions]\nrollover_hours = 2\n", 0o644);
+        Config::load(&p).unwrap();
+    }
+
+    #[test]
+    fn secrets_are_trimmed_from_every_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = token_file(&dir, "t", "  from-file \t\n", 0o600);
+        let c = cfg(&format!("[tole]\ntoken_file = \"{}\"\n", f.display()));
+        assert_eq!(
+            c.tole_auth(&env_of(&[])).unwrap(),
+            ToleAuth::Bearer(Secret::new("from-file"))
+        );
+        let c = cfg("[tole]\ntoken = \" inline \"\n");
+        assert_eq!(
+            c.tole_auth(&env_of(&[])).unwrap(),
+            ToleAuth::Bearer(Secret::new("inline"))
+        );
+        assert_eq!(
+            c.tole_auth(&env_of(&[(ENV_TOLE_TOKEN, "\tenv  ")]))
+                .unwrap(),
+            ToleAuth::Bearer(Secret::new("env"))
+        );
+        let c = cfg("[tole]\nbasic_user = \"u\"\nbasic_password = \" p \"\n");
+        assert_eq!(
+            c.tole_auth(&env_of(&[])).unwrap(),
+            ToleAuth::Basic {
+                user: "u".into(),
+                password: Secret::new("p")
+            }
+        );
+        assert_eq!(
+            cfg("[telegram]\nbot_token = \" 1:a \"\n")
+                .bot_token(&env_of(&[]))
+                .unwrap(),
+            Secret::new("1:a")
+        );
     }
 
     #[test]

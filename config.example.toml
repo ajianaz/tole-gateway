@@ -1,7 +1,8 @@
 # tole-gateway configuration. Copy to a private location and edit.
 #
 # Secrets (bearer token, Basic password, bot token) should come from the
-# environment or from a file with mode 0600, not from this file.
+# environment or from a file with mode 0600, not from this file. If this file
+# does hold a secret it must be chmod 600 too, or the gateway refuses to start.
 # Environment variables win over files, and files win over inline values:
 #   TOLE_SERVE_TOKEN, TOLE_SERVE_BASIC_USER, TOLE_SERVE_BASIC_PASSWORD,
 #   TOLE_GATEWAY_BOT_TOKEN
@@ -11,7 +12,8 @@
 # state_dir = "/var/lib/tole-gateway"
 
 [tole]
-# Base URL of `tole serve`. It speaks plain HTTP: keep it on loopback.
+# Base URL of `tole serve`. It speaks plain HTTP, so http:// is accepted only on loopback
+# (use https:// otherwise). No user:pass@ in the URL.
 url = "http://127.0.0.1:7801"
 # Bearer token (prefer TOLE_SERVE_TOKEN or token_file).
 # token = "..."
@@ -35,7 +37,7 @@ prompt_timeout_secs = 1800
 # bot_token = "123456:..."
 # File holding the bot token; must be chmod 600.
 # bot_token_file = "/etc/tole-gateway/bot.token"
-# Bot API base URL; change only for tests.
+# Bot API base URL; change only for tests (http:// only on loopback).
 api_base = "https://api.telegram.org"
 # Long-poll timeout in seconds (1 to 50).
 poll_timeout_secs = 30

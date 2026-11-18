@@ -10,13 +10,13 @@ and column but never the offending value.
 `$XDG_STATE_HOME/tole-gateway`, else `$HOME/.local/state/tole-gateway`; if none
 of these is available, it is an error.
 
-`[tole]`: `url` (default `http://127.0.0.1:7801`, must be http or https),
+`[tole]`: `url` (default `http://127.0.0.1:7801`, must be http or https with a host, no user name or password; plain http only to loopback),
 `token`, `token_file`, `basic_user`, `basic_password`, `profile` (optional,
 `[a-z0-9_-]{1,64}`), `cwd` (optional), `request_timeout_secs` (default 30, > 0),
 `prompt_timeout_secs` (default 1800, > 0).
 
 `[telegram]`: `bot_token`, `bot_token_file`, `api_base` (default
-`https://api.telegram.org`, http or https), `poll_timeout_secs` (default 30,
+`https://api.telegram.org`, same URL rules), `poll_timeout_secs` (default 30,
 between 1 and 50).
 
 `[auth]`: `allowed_user_ids` (default empty, positive integers),
@@ -38,8 +38,8 @@ Validation reports all problems in a single error, one per line.
 | `XDG_STATE_HOME`, `HOME` | default for `state_dir` |
 
 For each secret the order is: environment, then the `*_file` key, then the
-inline value. Blank values are errors, at any level. Token files have one
-trailing newline removed.
+inline value. Every value is trimmed of surrounding whitespace, whatever its
+source; a value that is blank after trimming is an error.
 
 For `tole serve`, exactly one scheme must resolve: a bearer token, or a Basic
 user plus password. Configuring both, neither, or only half of the Basic pair
@@ -47,14 +47,24 @@ is an error.
 
 ## Token files
 
-On unix a token file must not be readable by group or others. A file with
-`mode & 0o077 != 0` is rejected; fix it with `chmod 600 <file>`.
+A token file is opened once and checked on that open handle. It must be a
+regular file (no FIFO, device or directory) of at most 4 KiB. On unix it must
+not be readable by group or others (`mode & 0o077 != 0` is rejected; fix it with
+`chmod 600 <file>`) and must be owned by the user running the gateway (checked
+when the process uid can be read from `/proc/self`).
+
+The same mode rule applies to the main config file when it holds an inline
+secret (`tole.token`, `tole.basic_password` or `telegram.bot_token`). A config
+file without inline secrets has no mode requirement.
 
 ## Network note
 
-`tole serve` speaks plain HTTP. Keep it on `127.0.0.1` (the default) so the
-bearer token never crosses a network. If the gateway must reach serve on
-another host, put it behind a TLS-terminating proxy or an SSH tunnel and point
-`tole.url` at that.
+`tole serve` speaks plain HTTP. `tole.url` and `telegram.api_base` may use
+`http://` only for loopback hosts (`localhost`, `127.0.0.0/8`, `::1`); any other
+`http://` host is rejected because credentials (or the bot token, which is part
+of the Bot API path) would cross the network in clear text. If the gateway must
+reach serve on another host, put it behind a TLS-terminating proxy or an SSH
+tunnel and use an `https://` URL or a loopback URL. URLs must not embed
+credentials (`http://user:pass@host`); use the token keys instead.
 
 Secrets are never printed: errors and `Debug` output show `***` or omit them.
