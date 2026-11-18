@@ -472,6 +472,26 @@ async fn the_pairing_code_is_announced_once_and_refreshed_after_it_expires() {
 }
 
 #[tokio::test]
+async fn pressing_an_expired_button_denies_it_and_unblocks_the_chat() {
+    let r = rig(&[OWNER]).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write")).await;
+    let allow = button(&r.tg, 0);
+    r.clock.advance(Duration::from_secs(901));
+    r.app.handle(press(OWNER, OWNER, &allow)).await;
+    assert_eq!(
+        r.tole.decisions(),
+        vec![("apr-1".to_owned(), "deny".to_owned())],
+        "an expired press is a denial, never an allow"
+    );
+    // The chat is not stuck on "Waiting for your decision".
+    r.tole
+        .script_prompt(PromptStep::reply("end_turn", Some("fresh start")));
+    r.app.handle(msg(OWNER, OWNER, "again")).await;
+    assert_eq!(texts(&r.tg).last().unwrap(), "fresh start");
+}
+
+#[tokio::test]
 async fn the_run_loop_serves_telegram_updates_end_to_end() {
     let r = rig(&[OWNER]).await;
     r.tole

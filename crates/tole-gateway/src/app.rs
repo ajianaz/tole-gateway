@@ -680,11 +680,32 @@ where
             }
             Resolve::Expired => {
                 answer(Some("This approval expired and was denied.")).await;
-                self.sweep().await;
+                self.deny_pending(chat).await;
             }
             Resolve::Unknown => answer(Some("This button is no longer valid.")).await,
             Resolve::WrongChat => answer(None).await,
         }
+    }
+
+    /// Deny the chat's pending approval (its window closed) so the chat is not
+    /// left waiting on a button that can no longer be used.
+    async fn deny_pending(&self, chat: ChatId) {
+        let taken = self.with(|i| i.chats.get_mut(&chat).and_then(|r| r.pending.take()));
+        let Some(p) = taken else { return };
+        match self.tole.decide(&p.approval_id, Decision::Deny).await {
+            Ok(_) | Err(ToleError::NotFound(_)) => {}
+            Err(e) => warn!("could not deny an expired approval: {e}"),
+        }
+        let note = format!("{}: not answered in time, denied.", cap(&p.tool, 60));
+        if let Err(e) = self.chat.finish_approval(p.message, &note).await {
+            debug!("could not update an expired approval message: {e}");
+        }
+        self.say(
+            chat,
+            "That approval was not answered in time and was denied. Send your message again if \
+             you still want it.",
+        )
+        .await;
     }
 
     async fn apply_decision(&self, chat: ChatId, p: Pending, decision: Decision) {

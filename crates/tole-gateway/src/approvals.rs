@@ -60,13 +60,41 @@ struct Entry {
 }
 
 /// Bounded table that maps short button tokens to approvals.
-#[derive(Debug, Default)]
+///
+/// Every table carries a nonce taken from the start time and put into the
+/// button data, so a button from an earlier process (the counter restarts at 1
+/// after a restart) can never resolve to a different, newer approval.
+#[derive(Debug)]
 pub struct ApprovalButtons {
     entries: VecDeque<Entry>,
     next_token: u64,
+    nonce: u64,
+}
+
+impl Default for ApprovalButtons {
+    fn default() -> Self {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        Self {
+            entries: VecDeque::new(),
+            next_token: 0,
+            nonce,
+        }
+    }
 }
 
 impl ApprovalButtons {
+    /// A table with a fixed nonce, so tests can simulate two processes.
+    #[cfg(test)]
+    fn with_nonce(nonce: u64) -> Self {
+        Self {
+            nonce,
+            ..Self::default()
+        }
+    }
+
     /// An empty table.
     pub fn new() -> Self {
         Self::default()
@@ -122,11 +150,11 @@ impl ApprovalButtons {
             buttons: vec![vec![
                 Button {
                     label: "Allow".into(),
-                    data: format!("a{token}:y"),
+                    data: format!("a{:x}-{token}:y", self.nonce),
                 },
                 Button {
                     label: "Deny".into(),
-                    data: format!("a{token}:n"),
+                    data: format!("a{:x}-{token}:n", self.nonce),
                 },
             ]],
         }
@@ -135,9 +163,13 @@ impl ApprovalButtons {
     /// Resolve a button press. A live press from the right chat consumes the
     /// entry, so a repeat is `Unknown`. Nothing else yields `Allow`.
     pub fn resolve(&mut self, chat: ChatId, data: &str, now_ms: u64) -> Resolve {
-        let Some((token, decision)) = parse(data) else {
+        let Some((nonce, token, decision)) = parse(data) else {
             return Resolve::Unknown;
         };
+        if nonce != self.nonce {
+            // A button from an earlier process: never map it to a new approval.
+            return Resolve::Unknown;
+        }
         let Some(pos) = self.entries.iter().position(|e| e.token == token) else {
             return Resolve::Unknown;
         };
@@ -182,11 +214,17 @@ impl ApprovalButtons {
     }
 }
 
-/// `a<digits>:y` or `a<digits>:n`, nothing else.
-fn parse(data: &str) -> Option<(u64, Decision)> {
+/// `a<hex nonce>-<digits>:y` or `...:n`, nothing else.
+fn parse(data: &str) -> Option<(u64, u64, Decision)> {
     let rest = data.strip_prefix('a')?;
-    let (num, tail) = rest.split_once(':')?;
-    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+    let (body, tail) = rest.split_once(':')?;
+    let (nonce, num) = body.split_once('-')?;
+    if nonce.is_empty()
+        || nonce.len() > 16
+        || !nonce.bytes().all(|b| b.is_ascii_hexdigit())
+        || num.is_empty()
+        || !num.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
     let decision = match tail {
@@ -194,7 +232,11 @@ fn parse(data: &str) -> Option<(u64, Decision)> {
         "n" => Decision::Deny,
         _ => return None,
     };
-    Some((num.parse().ok()?, decision))
+    Some((
+        u64::from_str_radix(nonce, 16).ok()?,
+        num.parse().ok()?,
+        decision,
+    ))
 }
 
 /// Collapse whitespace, drop control characters, truncate to `max` characters
@@ -451,5 +493,31 @@ mod tests {
         let mut t = ApprovalButtons::new();
         let p = t.prompt_for(CHAT, &row("a1", "  "), T0);
         assert_eq!(p.text.lines().count(), 3);
+    }
+    #[test]
+    fn a_button_from_an_earlier_process_never_resolves_to_a_new_approval() {
+        // Both tables hand out counter 1, as a restart would.
+        let mut old = ApprovalButtons::with_nonce(0xAAAA);
+        let (stale_allow, stale_deny) = datas(&old.prompt_for(CHAT, &row("old", "d"), T0));
+        let mut fresh = ApprovalButtons::with_nonce(0xBBBB);
+        let (fresh_allow, _) = datas(&fresh.prompt_for(CHAT, &row("new", "d"), T0));
+        assert_eq!(fresh.resolve(CHAT, &stale_allow, T0), Resolve::Unknown);
+        assert_eq!(fresh.resolve(CHAT, &stale_deny, T0), Resolve::Unknown);
+        // The new approval is untouched and still resolves with its own button.
+        assert_eq!(
+            fresh.resolve(CHAT, &fresh_allow, T0),
+            Resolve::Decide {
+                approval_id: "new".into(),
+                decision: Decision::Allow,
+            }
+        );
+    }
+
+    #[test]
+    fn button_data_stays_within_the_telegram_limit() {
+        let mut t = ApprovalButtons::with_nonce(u64::MAX);
+        t.next_token = 999_999_999;
+        let (a, d) = datas(&t.prompt_for(CHAT, &row("x", "d"), T0));
+        assert!(a.len() <= 64 && d.len() <= 64, "{a} {d}");
     }
 }
