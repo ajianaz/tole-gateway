@@ -316,11 +316,12 @@ async fn typing_answer_and_commands() {
 #[tokio::test]
 async fn maps_rate_limit_gone_api_and_decode() {
     let (fake, tg) = setup().await;
-    fake.rate_limit_once(3);
+    // Two 429s in a row: the single retry fails too and the error surfaces.
+    fake.rate_limit_after(0, 2, 1);
     assert!(matches!(
         tg.send_text(ChatId(1), "x").await,
         Err(ChatError::RateLimited {
-            retry_after_secs: 3
+            retry_after_secs: 1
         })
     ));
     fake.forbid_once();
@@ -399,4 +400,74 @@ async fn updates_flow_through_the_adapter_in_order() {
         })
         .collect();
     assert_eq!(texts, vec!["m0", "m1", "m2", "m3", "m4"]);
+}
+
+#[tokio::test]
+async fn rate_limited_part_is_retried_once_without_resending_others() {
+    let (fake, tg) = setup().await;
+    let text = "q".repeat(4096 * 3);
+    // Part 1 passes, part 2 hits a 429 once and is retried, part 3 passes.
+    fake.rate_limit_after(1, 1, 1);
+    let started = Instant::now();
+    let r = tg.send_text(ChatId(9), &text).await.unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    let parts = sent_texts(&fake);
+    assert_eq!(parts.len(), 3, "every part exactly once");
+    assert_eq!(parts.concat(), text);
+    assert_eq!(r.message_id, 1002);
+}
+
+#[tokio::test]
+async fn rate_limit_retry_failing_returns_the_error_and_stops() {
+    let (fake, tg) = setup().await;
+    let text = "q".repeat(4096 * 3);
+    fake.rate_limit_after(1, 2, 1);
+    let err = tg.send_text(ChatId(9), &text).await.unwrap_err();
+    assert!(matches!(err, ChatError::RateLimited { .. }), "{err:?}");
+    assert_eq!(sent_texts(&fake).len(), 1, "later parts are not sent");
+}
+
+#[tokio::test]
+async fn long_output_is_capped_at_twenty_parts_with_a_notice() {
+    let (fake, tg) = setup().await;
+    let text = "w".repeat(4096 * 25 + 7);
+    tg.send_text(ChatId(9), &text).await.unwrap();
+    let parts = sent_texts(&fake);
+    assert_eq!(parts.len(), 20);
+    assert!(parts[..19].iter().all(|p| p.len() == 4096));
+    let left = 4096 * 6 + 7;
+    assert_eq!(
+        parts[19],
+        format!("[output truncated: {left} more characters]")
+    );
+}
+
+#[tokio::test]
+async fn finish_approval_truncates_to_one_valid_edit() {
+    let (fake, tg) = setup().await;
+    let msg = MessageRef {
+        chat: ChatId(9),
+        message_id: 55,
+    };
+    let text = "😀".repeat(5000);
+    tg.finish_approval(msg, &text).await.unwrap();
+    let edits = fake.edits();
+    assert_eq!(edits.len(), 1);
+    let sent = edits[0]["text"].as_str().unwrap();
+    assert!(utf16(sent) <= 4096, "{}", utf16(sent));
+    assert!(sent.ends_with('\u{2026}'));
+    assert!(fake.sent_messages().is_empty());
+}
+
+#[tokio::test]
+async fn callback_without_a_message_is_dropped() {
+    let (fake, tg) = setup().await;
+    fake.push_update(json!({"callback_query": {
+        "id": "cb1", "chat_instance": "ci",
+        "from": {"id": 9, "is_bot": false, "first_name": "t"},
+        "data": "a:1"}}));
+    fake.push_text(9, 9, "after");
+    let got = tg.next().await.unwrap();
+    assert_eq!(got.len(), 1);
+    assert!(matches!(got[0], Inbound::Message { .. }));
 }

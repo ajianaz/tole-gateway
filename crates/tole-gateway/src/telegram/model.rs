@@ -76,26 +76,25 @@ pub(crate) fn normalize(raw: &Value) -> Option<Inbound> {
             return None;
         }
         let data = cb.data?;
-        let message = match cb.message {
-            Some(m) => {
-                if m.chat.kind != "private" {
-                    return None;
-                }
-                Some(MessageRef {
-                    chat: ChatId(m.chat.id),
-                    message_id: m.message_id,
-                })
-            }
-            None => None,
+        // A callback without a message (inline mode, or a message too old for
+        // Telegram to include) cannot be tied to a verified private chat, and
+        // this bot only attaches keyboards to its own messages: drop it
+        // instead of guessing the chat from the user id.
+        let m = cb.message?;
+        if m.chat.kind != "private" {
+            return None;
+        }
+        let message = MessageRef {
+            chat: ChatId(m.chat.id),
+            message_id: m.message_id,
         };
-        // In a private chat the chat id equals the user id.
-        let chat = message.map_or(ChatId(cb.from.id), |m| m.chat);
+        let chat = message.chat;
         return Some(Inbound::Callback {
             chat,
             user: UserId(cb.from.id),
             callback_id: cb.id,
             data,
-            message,
+            message: Some(message),
         });
     }
     None
@@ -182,14 +181,7 @@ mod tests {
         );
         let no_msg =
             json!({"update_id":2,"callback_query":{"id":"cb2","from":{"id":9},"data":"d"}});
-        assert!(matches!(
-            normalize(&no_msg),
-            Some(Inbound::Callback {
-                message: None,
-                chat: ChatId(9),
-                ..
-            })
-        ));
+        assert_eq!(normalize(&no_msg), None);
         let no_data = json!({"update_id":3,"callback_query":{"id":"cb3","from":{"id":9}}});
         assert_eq!(normalize(&no_data), None);
     }

@@ -44,6 +44,9 @@ const MAX_CALLBACK_DATA: usize = 64;
 /// Telegram's cap on the `answerCallbackQuery` notice, in characters.
 const MAX_ANSWER_TEXT: usize = 200;
 
+/// Longest wait honoured when Telegram answers 429 on an outbound call.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
+
 /// Everything [`TelegramAdapter`] needs.
 #[derive(Debug, Clone)]
 pub struct TelegramConfig {
@@ -130,6 +133,24 @@ impl TelegramAdapter {
         Ok(MessageRef { chat, message_id })
     }
 
+    /// Send one part. On a rate limit, wait the requested time (at most
+    /// [`MAX_RETRY_WAIT`]) and try that same part once more; a second failure
+    /// is returned. Parts already sent are never resent by the caller.
+    async fn send_part_retrying(
+        &self,
+        chat: ChatId,
+        part: &str,
+        keyboard: Option<Value>,
+    ) -> Result<MessageRef, ChatError> {
+        match self.send_one(chat, part, keyboard.clone()).await {
+            Err(ChatError::RateLimited { retry_after_secs }) => {
+                tokio::time::sleep(Duration::from_secs(retry_after_secs).min(MAX_RETRY_WAIT)).await;
+                self.send_one(chat, part, keyboard).await
+            }
+            other => other,
+        }
+    }
+
     /// Send every part; the keyboard (if any) goes on the last one. Returns
     /// the reference of the last part.
     async fn send_parts(
@@ -144,7 +165,7 @@ impl TelegramAdapter {
         let mut sent = None;
         for (i, part) in parts.iter().enumerate() {
             let k = if i == last { keyboard.take() } else { None };
-            sent = Some(self.send_one(chat, part, k).await?);
+            sent = Some(self.send_part_retrying(chat, part, k).await?);
         }
         sent.ok_or_else(|| ChatError::Decode("nothing was sent".into()))
     }
@@ -204,9 +225,19 @@ impl ChatPort for TelegramAdapter {
         self.send_parts(chat, &prompt.text, Some(kb)).await
     }
 
+    /// Edits the approval message in place and removes its keyboard. The
+    /// edit is ONE message: approval prompts are short and bounded by the
+    /// caller, so longer text is truncated (ellipsis, char boundary), never
+    /// split into several messages.
     async fn finish_approval(&self, message: MessageRef, text: &str) -> Result<(), ChatError> {
-        // An edit is one message: keep the first part only.
-        let text = split_or_placeholder(text).swap_remove(0);
+        // An edit is one message. Approval prompts are short and bounded by
+        // the caller, so there is no multi-part editing: text over the limit
+        // is cut at a char boundary and ends with an ellipsis.
+        let text = if text.trim().is_empty() {
+            "(empty message)".to_string()
+        } else {
+            render::truncate_one(text)
+        };
         let body = json!({
             "chat_id": message.chat.0,
             "message_id": message.message_id,

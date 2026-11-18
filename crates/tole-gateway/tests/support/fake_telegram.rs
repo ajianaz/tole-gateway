@@ -24,7 +24,9 @@
 //! plus `tokens_seen()` (the token segment of each request path).
 //!
 //! Failure switches (apply to the next request of any method, once):
-//! `rate_limit_once(secs)` (HTTP 429 with `retry_after`), `forbid_once()`
+//! `rate_limit_once(secs)` (HTTP 429 with `retry_after`),
+//! `rate_limit_after(pass, times, secs)` (let `pass` requests through first),
+//! `forbid_once()`
 //! (HTTP 403 "bot was blocked"), `reject_once(description)` (HTTP 400
 //! `ok:false`), `raw_once(status, body)` (any bytes, e.g. bad JSON).
 //!
@@ -57,7 +59,9 @@ struct Inner {
     commands: Vec<Value>,
     polls: Vec<Value>,
     tokens: Vec<String>,
-    fail: Option<(u16, Vec<u8>)>,
+    /// One entry per upcoming request: `Some` answers with that failure,
+    /// `None` lets the request through.
+    fail: VecDeque<Option<(u16, Vec<u8>)>>,
 }
 
 struct Shared {
@@ -188,25 +192,40 @@ impl FakeTelegram {
         let body = json!({"ok": false, "error_code": 429,
             "description": format!("Too Many Requests: retry after {retry_after}"),
             "parameters": {"retry_after": retry_after}});
-        self.with(|i| i.fail = Some((429, body.to_string().into_bytes())));
+        self.with(|i| i.fail = VecDeque::from([Some((429, body.to_string().into_bytes()))]));
+    }
+
+    /// Let `pass` requests through, then answer the next `times` requests
+    /// with HTTP 429 and `retry_after`.
+    pub fn rate_limit_after(&self, pass: usize, times: usize, retry_after: u64) {
+        let body = json!({"ok": false, "error_code": 429,
+            "description": format!("Too Many Requests: retry after {retry_after}"),
+            "parameters": {"retry_after": retry_after}})
+        .to_string()
+        .into_bytes();
+        self.with(|i| {
+            i.fail.clear();
+            i.fail.extend((0..pass).map(|_| None));
+            i.fail.extend((0..times).map(|_| Some((429, body.clone()))));
+        });
     }
 
     /// Answer the next request with HTTP 403 "bot was blocked".
     pub fn forbid_once(&self) {
         let body = json!({"ok": false, "error_code": 403,
             "description": "Forbidden: bot was blocked by the user"});
-        self.with(|i| i.fail = Some((403, body.to_string().into_bytes())));
+        self.with(|i| i.fail = VecDeque::from([Some((403, body.to_string().into_bytes()))]));
     }
 
     /// Answer the next request with HTTP 400 and `ok:false`.
     pub fn reject_once(&self, description: &str) {
         let body = json!({"ok": false, "error_code": 400, "description": description});
-        self.with(|i| i.fail = Some((400, body.to_string().into_bytes())));
+        self.with(|i| i.fail = VecDeque::from([Some((400, body.to_string().into_bytes()))]));
     }
 
     /// Answer the next request with arbitrary bytes.
     pub fn raw_once(&self, status: u16, body: &str) {
-        self.with(|i| i.fail = Some((status, body.as_bytes().to_vec())));
+        self.with(|i| i.fail = VecDeque::from([Some((status, body.as_bytes().to_vec()))]));
     }
 
     /// Bodies of `sendMessage` calls.
@@ -277,7 +296,7 @@ async fn handle(
     let injected = {
         let mut i = shared.inner.lock().unwrap();
         i.tokens.push(bot);
-        i.fail.take()
+        i.fail.pop_front().flatten()
     };
     if let Some((status, bytes)) = injected {
         return reply(status, bytes);
