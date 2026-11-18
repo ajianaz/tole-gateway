@@ -21,7 +21,13 @@
 //! - Sessions: `add_session(id)`, `set_entries(id, entries)` (each entry is a
 //!   JSON object; `seq` is filled in as 1, 2, ... when missing),
 //!   `add_message(id, role, text)`. `POST /sessions` creates `srv-N` sessions;
-//!   a resume of an unknown id is a 404. Unknown sessions answer 404.
+//!   a resume of an unknown id is a 404. Unknown sessions answer 404. The real
+//!   server (tole 0.11.0) answers a PROMPT to one with
+//!   `500 {"error":"unknown session: <id>"}`; `real_unknown_prompt_500()`
+//!   switches the fake to that, and `restart()` does it too.
+//! - `restart()` simulates a `tole serve` restart: every session stops being
+//!   live (all routes then answer as for an unknown session) but its log
+//!   survives, and `POST /sessions {"resume": id}` makes it live again.
 //! - Prompts: `script_prompt(PromptStep)` queues one answer per prompt call
 //!   (FIFO); with an empty queue a prompt answers `end_turn` with `"ok"`.
 //!   `PromptStep::delayed(duration, step)` sleeps before answering.
@@ -118,6 +124,10 @@ struct Inner {
     prompts: VecDeque<PromptStep>,
     approvals: Vec<Value>,
     sessions: HashMap<String, Vec<Value>>,
+    /// Sessions whose log survived a `restart()` and are not live.
+    dormant: HashMap<String, Vec<Value>>,
+    /// A prompt to an unknown session answers the real server's 500.
+    unknown_prompt_500: bool,
     failures: Vec<(String, String, u16, String)>,
     decisions: Vec<(String, String)>,
     log: Vec<LoggedRequest>,
@@ -193,6 +203,26 @@ impl FakeTole {
                 .collect();
             s.sessions.insert(id.to_string(), entries);
         });
+    }
+
+    /// Answer a prompt to an unknown session like the real server: `500`.
+    pub fn real_unknown_prompt_500(&self) {
+        self.with(|s| s.unknown_prompt_500 = true);
+    }
+
+    /// Simulate a `tole serve` restart: no session is live any more, the logs
+    /// survive and can be resumed.
+    pub fn restart(&self) {
+        self.real_unknown_prompt_500();
+        self.with(|s| {
+            let live: Vec<_> = s.sessions.drain().collect();
+            s.dormant.extend(live);
+        });
+    }
+
+    /// Forget the logs that survived a `restart()` (the session files are gone).
+    pub fn lose_dormant_logs(&self) {
+        self.with(|s| s.dormant.clear());
     }
 
     pub fn add_message(&self, id: &str, role: &str, text: &str) {
@@ -424,7 +454,12 @@ fn route(s: &mut Inner, method: &str, seg: &[String], query: &str, body: &Value)
             let mut out = json!({});
             if let Some(id) = body.get("resume").and_then(Value::as_str) {
                 if !s.sessions.contains_key(id) {
-                    return not_found("unknown session");
+                    match s.dormant.remove(id) {
+                        Some(log) => {
+                            s.sessions.insert(id.to_string(), log);
+                        }
+                        None => return not_found("unknown session"),
+                    }
                 }
                 out["sessionId"] = json!(id);
                 out["workspace"] = json!(cwd);
@@ -473,6 +508,10 @@ fn route(s: &mut Inner, method: &str, seg: &[String], query: &str, body: &Value)
         }
         ("POST", ["sessions", id, "prompt"]) => {
             if !s.sessions.contains_key(*id) {
+                if s.unknown_prompt_500 {
+                    // The real server answers 500, not 404, here.
+                    return Routed::Now(500, json!({"error": format!("unknown session: {id}")}));
+                }
                 return not_found("unknown session");
             }
             if body.get("text").and_then(Value::as_str).is_none() {

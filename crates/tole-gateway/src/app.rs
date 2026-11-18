@@ -187,6 +187,17 @@ fn reply_text(stop_reason: &str, text: Option<&str>) -> String {
     }
 }
 
+/// True when tole does not know the session. A prompt to a session the server
+/// no longer holds (after a restart) is answered `500 {"error": "unknown
+/// session: <id>"}` by tole 0.11, not 404, so that text counts too.
+fn is_unknown_session(e: &ToleError) -> bool {
+    match e {
+        ToleError::NotFound(_) => true,
+        ToleError::Server(text) => text.trim_start().starts_with("unknown session"),
+        _ => false,
+    }
+}
+
 fn tole_error_text(e: &ToleError) -> String {
     match e {
         ToleError::Unauthorized => {
@@ -572,7 +583,7 @@ where
         text: &str,
     ) -> Result<(String, PromptOutcome), Fail> {
         match self.tole.prompt(session_id, text).await {
-            Err(ToleError::NotFound(_)) => {
+            Err(e) if is_unknown_session(&e) => {
                 let sid = match self
                     .tole
                     .resume_session(session_id, self.settings.profile.as_deref())
@@ -938,6 +949,16 @@ mod tests {
         assert!(matches!(parse_command("/start"), Some(Command::Help)));
         assert!(matches!(parse_command("/nope"), Some(Command::Unknown)));
         assert!(parse_command("hello /new").is_none());
+    }
+
+    #[test]
+    fn unknown_session_covers_the_real_servers_500() {
+        assert!(is_unknown_session(&ToleError::NotFound("x".into())));
+        assert!(is_unknown_session(&ToleError::Server(
+            "unknown session: srv-1".into()
+        )));
+        assert!(!is_unknown_session(&ToleError::Server("boom".into())));
+        assert!(!is_unknown_session(&ToleError::Busy));
     }
 
     #[test]

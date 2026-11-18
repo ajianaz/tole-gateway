@@ -232,6 +232,45 @@ async fn the_second_message_reuses_the_session() {
 }
 
 #[tokio::test]
+async fn after_a_tole_restart_the_session_is_resumed_from_its_log() {
+    let r = rig(&[OWNER]).await;
+    r.app.handle(msg(OWNER, OWNER, "before")).await;
+    r.tole.add_message("srv-1", "user", "before");
+    r.tole.restart();
+    r.tole
+        .script_prompt(PromptStep::reply("end_turn", Some("still here")));
+    r.app.handle(msg(OWNER, OWNER, "after")).await;
+    // Real tole answers a prompt to a forgotten session with 500, not 404:
+    // the gateway resumes the same session instead of reporting a problem.
+    assert_eq!(texts(&r.tg).last().unwrap(), "still here");
+    assert_eq!(post_sessions(&r.tole), 2, "one create, one resume");
+    let posts: Vec<_> = r
+        .tole
+        .requests()
+        .into_iter()
+        .filter(|q| q.method == "POST" && q.path == "/sessions")
+        .collect();
+    assert_eq!(posts[1].body["resume"], "srv-1");
+    assert_eq!(r.tole.requests_to("/sessions/srv-1/prompt").len(), 3);
+}
+
+#[tokio::test]
+async fn after_a_restart_with_the_log_gone_a_new_session_starts() {
+    let r = rig(&[OWNER]).await;
+    r.app.handle(msg(OWNER, OWNER, "before")).await;
+    r.tole.restart();
+    // The log is gone too: not even resumable.
+    r.tole.fail("POST", "/sessions", 404, "unknown session");
+    r.app.handle(msg(OWNER, OWNER, "after")).await;
+    let all = texts(&r.tg);
+    assert!(
+        all.iter()
+            .any(|t| t.contains("My previous session is gone")),
+        "{all:?}"
+    );
+}
+
+#[tokio::test]
 async fn the_session_rolls_over_after_four_idle_hours_only() {
     let r = rig(&[OWNER]).await;
     r.app.handle(msg(OWNER, OWNER, "one")).await;
