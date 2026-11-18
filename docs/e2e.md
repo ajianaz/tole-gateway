@@ -1,0 +1,83 @@
+# End-to-end tests against a real `tole serve`
+
+The unit and integration tests of this crate run against fakes (a fake
+`tole serve`, a fake Telegram Bot API). `crates/tole-gateway/tests/e2e.rs`
+runs the gateway's real pieces against the real `tole` binary:
+
+- `HttpToleClient`, `TelegramAdapter` and `App` (with its run loop) are the
+  production code;
+- the Telegram Bot API is `tests/support/fake_telegram.rs`;
+- `tole serve` is the real process; its LLM is
+  `tests/support/fake_provider.rs`, an OpenAI-compatible `/chat/completions`
+  server on loopback (no network, no key).
+
+## Running
+
+Build tole once (the tests never build or modify it), then:
+
+```text
+TOLE_BIN=/path/to/tole/target/debug/tole \
+  cargo test -p tole-gateway --test e2e -- --ignored --test-threads=1
+```
+
+Every test is `#[ignore = "needs TOLE_BIN"]`, so a plain
+`cargo test --workspace` neither needs tole nor runs these. Tested against
+tole 0.11.0.
+
+Each test starts its own `tole serve` on `127.0.0.1:<free port>` with
+`--token-file`, `--no-auto-mcp`, a temp workspace and a temp `--sessions-dir`.
+The child gets `env_clear()` plus only `PATH`, `HOME`, `CODECORA_HOME`, the
+`XDG_*` dirs, `TMPDIR`, `TOLE_CRON_DIR`, `TOLE_NO_UPDATE_CHECK` and
+`TOLE_BASE_URL`/`TOLE_API_KEY`/`TOLE_MODEL`/`TOLE_STREAM=0`, so no proxy
+variable, user config or real key reaches it. No `--allow` is given, so every
+Write tool call parks in the approval queue. The test waits for `GET /health`,
+kills the child on drop, and prints the child's stderr when a test fails.
+
+## What the tests prove
+
+| Test | Scenario |
+|---|---|
+| `a_plain_message_is_answered_in_the_chat` | message in, `echo: ...` back; the provider got its key |
+| `approval_allow_writes_the_file_and_the_final_answer_reaches_the_chat` | `WRITE notes.md` queues an approval, the chat shows Allow/Deny, Allow resumes tole, the file is written in the workspace and `done: notes.md` reaches the chat (the wait-after-allow logic against the real server) |
+| `approval_deny_leaves_the_file_unwritten_and_says_so` | Deny: no file, the chat says so, the session still answers afterwards |
+| `the_same_session_is_reused_for_a_second_message` | one session file on disk, the second request carries the first turn |
+| `the_gateway_recovers_after_tole_restarts` | kill tole, start a new process on the same sessions dir and port: the gateway resumes the same session (history kept) without telling the user |
+| `cancel_stops_a_slow_turn` | `/cancel` during a 2 s provider delay ends the turn as `Cancelled.`; the session works afterwards |
+| `the_real_wire_shapes_match_what_the_gateway_assumes` | raw HTTP checks of the shapes below |
+
+## Verified wire facts (tole 0.11.0)
+
+- Final assistant message in `GET /sessions/{id}/entries`: an entry with
+  `type: "message"`, `payload: {"role": "assistant", "text": "<string>"}`.
+  Between turns the log also holds `error`, `intent`, `tool_result` entries and
+  a user-role `denial_note` message; `seq` is increasing and not dense.
+- `POST /sessions/{id}/prompt` that parks on a Write answers `200
+  {"stopReason":"approval_required","approval":{id, sessionId, tool,
+  description, status:"pending", createdAtMs, expiresInSeconds:900}}`. The row
+  equals the one in `GET /approvals?session=<id>`. A decided row stays in the
+  list with status `approved` or `denied`.
+- Allow answers `202 {"id","status":"approved","resuming":true}`. The resumed
+  turn first appends a user-role denial note (`denial_note: true`, "[tole] Your
+  call to `write_file` was denied ..."): the parked call is not re-run by tole
+  itself, the MODEL must repeat the identical call, which the one-shot allow
+  then lets through. The status shows `busy: true` while it runs and its
+  answer lands in the log.
+- Ids (`srv-<hex>-<n>-<hex>`, `apr-<hex>-<hex>`) contain only unreserved URL
+  characters, so the client's percent-encoding leaves them unchanged.
+- After a tole restart a prompt to the old session id answers **500**
+  `{"error":"unknown session: <id>"}` (the docs and other routes say 404; the
+  gateway treats both as a lost session). `POST /sessions {"resume": id}` then
+  answers 200 `resumed: true`, the log (a `<id>.jsonl` file in the sessions
+  dir) is intact; resuming an id with no file is 404.
+
+## Limits
+
+- No real Telegram: the Bot API is a fake, so message formatting limits, rate
+  limits, long polling behavior and button rendering on a phone are not
+  exercised.
+- No real model: the fake provider is stateless and deterministic. How a real
+  model reacts to tole's denial note after an allow (it must repeat the call)
+  is not covered; a model that answers with text instead would make the
+  gateway report that text without writing the file.
+- Single owner, one chat, one tole process; no concurrency stress, no 15
+  minute approval expiry, no profiles, no TLS or Basic auth.
