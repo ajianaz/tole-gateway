@@ -211,6 +211,16 @@ fn is_unknown_session(e: &ToleError) -> bool {
     }
 }
 
+/// Whether tole's answer to a decision says the decision took effect. An allow
+/// must come back `approved`; a deny `denied` (or `expired`, which also counts
+/// as denied).
+fn decision_applied(decision: Decision, status: &str) -> bool {
+    match decision {
+        Decision::Allow => status == "approved",
+        Decision::Deny => status == "denied" || status == "expired",
+    }
+}
+
 fn tole_error_text(e: &ToleError) -> String {
     match e {
         ToleError::Unauthorized => {
@@ -817,6 +827,18 @@ where
             Decision::Deny => "denied",
         };
         match self.tole.decide(&p.approval_id, decision).await {
+            Ok(ack) if !decision_applied(decision, &ack.status) => {
+                // tole answers with the row's existing status when the request
+                // had already closed (expired or decided elsewhere): nothing ran.
+                let status = cap(&ack.status, 20);
+                let note = format!("{}: already {status}.", cap(&p.tool, 60));
+                let _ = self.chat.finish_approval(p.message, &note).await;
+                let text = format!(
+                    "That approval was already {status} when your decision arrived, so nothing \
+                     was changed. Send your message again if you still want it."
+                );
+                self.say(chat, &text).await;
+            }
             Ok(_) => {
                 let note = format!("{}: {label}.", cap(&p.tool, 60));
                 if let Err(e) = self.chat.finish_approval(p.message, &note).await {
@@ -1117,6 +1139,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_matching_status_counts_as_applied() {
+        assert!(decision_applied(Decision::Allow, "approved"));
+        assert!(!decision_applied(Decision::Allow, "expired"));
+        assert!(!decision_applied(Decision::Allow, "denied"));
+        assert!(decision_applied(Decision::Deny, "denied"));
+        assert!(decision_applied(Decision::Deny, "expired"));
+        assert!(!decision_applied(Decision::Deny, "approved"));
+    }
 
     #[test]
     fn commands_are_recognized() {

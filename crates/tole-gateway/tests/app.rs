@@ -794,6 +794,32 @@ async fn an_allow_with_an_unreadable_state_says_unknown() {
 }
 
 #[tokio::test]
+async fn an_allow_that_reaches_tole_after_expiry_is_reported_honestly() {
+    let r = rig(&[OWNER]).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write")).await;
+    let allow = button(&r.tg, 0);
+    // tole closed the request just before the press arrived.
+    r.tole.set_approval_status("apr-1", "expired");
+    r.app.handle(press(OWNER, OWNER, &allow)).await;
+    let last = texts(&r.tg).last().unwrap().clone();
+    assert!(last.contains("already expired"), "{last}");
+    assert!(!last.to_lowercase().contains("allowed"), "{last}");
+    assert!(r.tole.decisions().is_empty(), "nothing was applied");
+    assert!(
+        r.tg.edits().iter().any(|e| e["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("already expired"))),
+        "the approval message shows the real state"
+    );
+    // The chat is not left waiting and not left busy.
+    r.tole
+        .script_prompt(PromptStep::reply("end_turn", Some("next")));
+    r.app.handle(msg(OWNER, OWNER, "again")).await;
+    assert_eq!(texts(&r.tg).last().unwrap(), "next");
+}
+
+#[tokio::test]
 async fn the_run_loop_serves_telegram_updates_end_to_end() {
     let r = rig(&[OWNER]).await;
     r.tole

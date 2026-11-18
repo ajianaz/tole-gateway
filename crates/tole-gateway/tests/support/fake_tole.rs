@@ -279,6 +279,15 @@ impl FakeTole {
         self.with(|s| s.apply_then_fail = true);
     }
 
+    /// Set the status of a row, for example `expired`.
+    pub fn set_approval_status(&self, id: &str, status: &str) {
+        self.with(|s| {
+            if let Some(row) = s.approvals.iter_mut().find(|a| a["id"] == id) {
+                row["status"] = json!(status);
+            }
+        });
+    }
+
     pub fn approval_row(&self, id: &str) -> Option<Value> {
         self.with(|s| s.approvals.iter().find(|a| a["id"] == id).cloned())
     }
@@ -571,6 +580,12 @@ fn route(s: &mut Inner, method: &str, seg: &[String], query: &str, body: &Value)
             let Some(row) = s.approvals.iter_mut().find(|a| a["id"] == *id) else {
                 return not_found("unknown approval id");
             };
+            // A row that is no longer pending keeps its status: the real queue
+            // answers with it instead of applying the decision.
+            let current = row["status"].as_str().unwrap_or("pending").to_owned();
+            if current != "pending" {
+                return Routed::Now(200, json!({"id": id, "status": current}));
+            }
             let allow = decision == "allow";
             let status = if allow { "approved" } else { "denied" };
             row["status"] = json!(status);

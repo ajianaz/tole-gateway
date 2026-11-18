@@ -107,3 +107,14 @@ the binary.
   running turn, so it is not done. The per-chat busy gate keeps this safe (one
   turn at a time, a pending approval blocks new work); only strict ordering is
   lost.
+- If tole fails to write its audit record after it marked an approval approved,
+  it answers 500 before any resume starts. The gateway reads the row back as
+  approved, watches the session, and ends with "finished without a text
+  answer" although nothing ran. The action did not execute, so this is
+  harmless; the message is imprecise.
+- The per-chat busy flag is a plain boolean, not a counter. A button press that
+  lands in the instant a prompt is being shown can clear the flag a moment
+  early; the pending-approval check still blocks new work, and tole refuses a
+  second turn on a busy session.
+- Approval rows carry no risk field and only Write-tier tools can be queued over
+  serve, so the message says so instead of showing a tier.
