@@ -66,6 +66,10 @@ struct Rig {
 }
 
 async fn rig(allowed: &[i64]) -> Rig {
+    rig_with(allowed, |_| {}).await
+}
+
+async fn rig_with(allowed: &[i64], tweak: impl FnOnce(&mut AppSettings)) -> Rig {
     let tole = FakeTole::start().await;
     tole.require_bearer(TOLE_TOKEN);
     let tg = FakeTelegram::start().await;
@@ -103,13 +107,14 @@ async fn rig(allowed: &[i64]) -> Rig {
     let announce: Announce = Arc::new(move |code: &PairingCode| {
         sink.lock().unwrap().push(code.reveal().to_owned());
     });
-    let settings = AppSettings {
+    let mut settings = AppSettings {
         poll_interval: Duration::from_millis(20),
         resume_grace: Duration::from_secs(2),
         typing_interval: Duration::from_secs(30),
         sweep_interval: Duration::from_secs(3600),
         ..AppSettings::default()
     };
+    tweak(&mut settings);
     let app = Arc::new(App::new(
         client,
         adapter.clone(),
@@ -528,6 +533,264 @@ async fn pressing_an_expired_button_denies_it_and_unblocks_the_chat() {
         .script_prompt(PromptStep::reply("end_turn", Some("fresh start")));
     r.app.handle(msg(OWNER, OWNER, "again")).await;
     assert_eq!(texts(&r.tg).last().unwrap(), "fresh start");
+}
+
+/// Press Allow on the shown approval in a task and wait until tole saw the
+/// decision (or `until` holds).
+fn press_in_task(r: &Rig, data: &str) -> tokio::task::JoinHandle<()> {
+    let app = Arc::clone(&r.app);
+    let data = data.to_owned();
+    tokio::spawn(async move { app.handle(press(OWNER, OWNER, &data)).await })
+}
+
+fn count_text(tg: &FakeTelegram, needle: &str) -> usize {
+    texts(tg).iter().filter(|t| t.contains(needle)).count()
+}
+
+#[tokio::test]
+async fn an_expired_press_denies_its_own_approval_not_the_live_one() {
+    let r = rig(&[OWNER]).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write")).await;
+    let old_allow = button(&r.tg, 0);
+    // /cancel denies A but its button entry stays in the table.
+    r.app.handle(msg(OWNER, OWNER, "/cancel")).await;
+    r.clock.advance(Duration::from_secs(600));
+    let row = r.tole.add_approval_at(
+        "apr-2",
+        "srv-1",
+        "write_file",
+        "write b.md",
+        tole_gateway::sessions::Clock::now_ms(&r.clock),
+    );
+    r.tole
+        .script_prompt(PromptStep::approval_required(Some(row)));
+    r.app.handle(msg(OWNER, OWNER, "again")).await;
+    r.clock.advance(Duration::from_secs(301));
+    r.app.handle(press(OWNER, OWNER, &old_allow)).await;
+
+    let decisions = r.tole.decisions();
+    assert!(
+        !decisions.iter().any(|(id, _)| id == "apr-2"),
+        "the live approval B must not be denied: {decisions:?}"
+    );
+    assert!(
+        !decisions.iter().any(|(_, d)| d == "allow"),
+        "never an allow"
+    );
+    // B is still pending in the chat.
+    r.app.handle(msg(OWNER, OWNER, "more")).await;
+    assert!(texts(&r.tg)
+        .last()
+        .unwrap()
+        .contains("Waiting for your decision"));
+}
+
+#[tokio::test]
+async fn resume_after_a_restart_sends_the_configured_cwd() {
+    let r = rig_with(&[OWNER], |s| s.cwd = Some("/w/proj".into())).await;
+    r.app.handle(msg(OWNER, OWNER, "before")).await;
+    r.tole.restart();
+    r.tole
+        .script_prompt(PromptStep::reply("end_turn", Some("still here")));
+    r.app.handle(msg(OWNER, OWNER, "after")).await;
+    assert_eq!(texts(&r.tg).last().unwrap(), "still here");
+    let posts: Vec<_> = r
+        .tole
+        .requests()
+        .into_iter()
+        .filter(|q| q.method == "POST" && q.path == "/sessions")
+        .collect();
+    assert_eq!(posts[1].body["resume"], "srv-1");
+    assert_eq!(posts[1].body["cwd"], "/w/proj");
+}
+
+#[tokio::test]
+async fn an_older_pending_row_is_not_taken_for_the_resumed_turns_request() {
+    let r = rig(&[OWNER]).await;
+    script_approval(&r.tole, "apr-1");
+    r.tole
+        .add_approval("old-1", "srv-1", "run_shell", "an older open request");
+    r.app.handle(msg(OWNER, OWNER, "write")).await;
+    let allow = button(&r.tg, 0);
+    let task = press_in_task(&r, &allow);
+    wait_until("the decision", || !r.tole.decisions().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    r.tole.add_message("srv-1", "assistant", "notes written");
+    task.await.unwrap();
+    assert_eq!(texts(&r.tg).last().unwrap(), "notes written");
+    assert_eq!(
+        count_text(&r.tg, "Approval needed"),
+        1,
+        "the older row was never shown"
+    );
+    assert_eq!(r.tole.decisions().len(), 1);
+}
+
+#[tokio::test]
+async fn approval_required_without_a_row_does_not_show_another_pending_row() {
+    let r = rig(&[OWNER]).await;
+    r.tole
+        .add_approval("old-1", "srv-1", "run_shell", "an older open request");
+    r.tole.add_session("srv-1");
+    r.tole.script_prompt(PromptStep::approval_required(None));
+    r.app.handle(msg(OWNER, OWNER, "write")).await;
+    assert!(texts(&r.tg)
+        .last()
+        .unwrap()
+        .contains("expired before I could show it"));
+    assert_eq!(count_text(&r.tg, "Approval needed"), 0);
+}
+
+#[tokio::test]
+async fn the_chat_stays_busy_between_the_press_and_the_watch() {
+    let r = rig_with(&[OWNER], |s| {
+        s.poll_interval = Duration::from_millis(150);
+        s.resume_grace = Duration::from_millis(100);
+    })
+    .await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write")).await;
+    let allow = button(&r.tg, 0);
+    // The baseline read fails and is retried, which keeps the press in its
+    // pre-decision phase for a while.
+    r.tole
+        .fail("GET", "/sessions/srv-1/entries", 500, "transient");
+    let task = press_in_task(&r, &allow);
+    wait_until("the baseline read", || {
+        !r.tole.requests_to("/sessions/srv-1/entries").is_empty()
+    })
+    .await;
+    r.app.handle(msg(OWNER, OWNER, "sneak in")).await;
+    assert_eq!(
+        r.tole.requests_to("/sessions/srv-1/prompt").len(),
+        1,
+        "a message between the press and the end must not start a turn"
+    );
+    assert!(texts(&r.tg)
+        .last()
+        .unwrap()
+        .contains("Still working on the previous message"));
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn an_unreadable_baseline_is_retried_then_reported_honestly() {
+    let r = rig_with(&[OWNER], |s| s.resume_grace = Duration::from_millis(100)).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write")).await;
+    let allow = button(&r.tg, 0);
+    r.tole
+        .fail("GET", "/sessions/srv-1/entries", 500, "transient");
+    r.app.handle(press(OWNER, OWNER, &allow)).await;
+    assert_eq!(
+        r.tole.requests_to("/sessions/srv-1/entries").len(),
+        3,
+        "three baseline attempts"
+    );
+    let last = texts(&r.tg).last().unwrap().clone();
+    assert!(last.contains("could not read its answer"), "{last}");
+    assert!(last.contains("/status"));
+}
+
+#[tokio::test]
+async fn the_last_answer_is_read_across_pages_once_idle() {
+    let r = rig(&[OWNER]).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write")).await;
+    let allow = button(&r.tg, 0);
+    let task = press_in_task(&r, &allow);
+    wait_until("the decision", || !r.tole.decisions().is_empty()).await;
+    let mut entries = Vec::new();
+    for i in 0..230 {
+        let (role, text) = match i {
+            1 => ("assistant", "midway".to_owned()),
+            229 => ("assistant", "the real answer".to_owned()),
+            n => ("user", format!("filler {n}")),
+        };
+        entries.push(serde_json::json!({
+            "type": "message", "timestamp": 1u64,
+            "payload": {"role": role, "text": text}
+        }));
+    }
+    r.tole.set_entries("srv-1", entries);
+    task.await.unwrap();
+    assert_eq!(texts(&r.tg).last().unwrap(), "the real answer");
+}
+
+#[tokio::test]
+async fn a_failed_denial_is_not_reported_as_denied_and_is_retried_by_the_sweep() {
+    let r = rig(&[OWNER]).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write")).await;
+    r.tole
+        .fail("POST", "/approvals/apr-1/decision", 500, "boom");
+    r.app.handle(msg(OWNER, OWNER, "/cancel")).await;
+    let last = texts(&r.tg).last().unwrap().clone();
+    assert!(!last.to_lowercase().contains("was denied"), "{last}");
+    assert!(last.contains("could not record the denial"), "{last}");
+    assert!(last.contains("15 minutes"));
+    assert!(r.tole.decisions().is_empty());
+    r.tole.clear_failures();
+    r.app.sweep().await;
+    assert_eq!(
+        r.tole.decisions(),
+        vec![("apr-1".to_owned(), "deny".to_owned())],
+        "the next sweep retries the denial"
+    );
+    r.app.sweep().await;
+    assert_eq!(r.tole.decisions().len(), 1, "retried once, then dropped");
+}
+
+#[tokio::test]
+async fn an_allow_that_was_applied_despite_the_error_is_watched() {
+    let r = rig(&[OWNER]).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write")).await;
+    let allow = button(&r.tg, 0);
+    r.tole.apply_decision_then_fail();
+    let task = press_in_task(&r, &allow);
+    wait_until("the decision", || !r.tole.decisions().is_empty()).await;
+    r.tole.add_message("srv-1", "assistant", "notes written");
+    task.await.unwrap();
+    assert_eq!(texts(&r.tg).last().unwrap(), "notes written");
+}
+
+#[tokio::test]
+async fn an_allow_that_was_not_recorded_shows_the_prompt_again() {
+    let r = rig(&[OWNER]).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write")).await;
+    let allow = button(&r.tg, 0);
+    r.tole
+        .fail("POST", "/approvals/apr-1/decision", 500, "boom");
+    r.app.handle(press(OWNER, OWNER, &allow)).await;
+    assert!(r.tole.decisions().is_empty());
+    assert_eq!(count_text(&r.tg, "Approval needed"), 2, "a fresh prompt");
+    assert!(count_text(&r.tg, "not recorded") >= 1);
+    let fresh = button(&r.tg, 1);
+    assert_ne!(fresh, allow);
+    // The chat waits on the fresh prompt.
+    r.app.handle(msg(OWNER, OWNER, "x")).await;
+    assert!(texts(&r.tg)
+        .last()
+        .unwrap()
+        .contains("Waiting for your decision"));
+}
+
+#[tokio::test]
+async fn an_allow_with_an_unreadable_state_says_unknown() {
+    let r = rig(&[OWNER]).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write")).await;
+    let allow = button(&r.tg, 0);
+    r.tole
+        .fail("POST", "/approvals/apr-1/decision", 500, "boom");
+    r.tole.fail("GET", "/approvals", 500, "boom");
+    r.app.handle(press(OWNER, OWNER, &allow)).await;
+    let last = texts(&r.tg).last().unwrap().clone();
+    assert!(last.contains("unknown"), "{last}");
+    assert!(last.contains("/status"));
 }
 
 #[tokio::test]

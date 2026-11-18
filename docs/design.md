@@ -98,3 +98,12 @@ the binary.
 | G3 | Approvals from chat: inline buttons, denial on timeout, polling fallback. | implemented, tested against fakes |
 | G4 | Cron results and notifications through the signed webhook delivery target; second channel (Discord) and the adapter seam extraction. | planned |
 | G5 | Web dashboard. | later |
+
+## Known limitations
+
+- Events of one `getUpdates` batch run on separate tasks, so the order in which
+  messages of one chat are handled is not guaranteed (for example `/new`
+  followed by a prompt). Serializing per chat would block `/cancel` behind a
+  running turn, so it is not done. The per-chat busy gate keeps this safe (one
+  turn at a time, a pending approval blocks new work); only strict ordering is
+  lost.

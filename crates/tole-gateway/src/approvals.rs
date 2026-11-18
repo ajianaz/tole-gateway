@@ -43,8 +43,12 @@ pub enum Resolve {
         /// Allow or Deny, exactly as pressed.
         decision: Decision,
     },
-    /// The window closed before the press (counts as denied).
-    Expired,
+    /// The window closed before the press (counts as denied). Carries the
+    /// approval the pressed button belonged to.
+    Expired {
+        /// The approval whose window closed.
+        approval_id: String,
+    },
     /// Not a live button: malformed, already used, or dropped.
     Unknown,
     /// The press came from a different chat than the prompt.
@@ -180,7 +184,9 @@ impl ApprovalButtons {
             return Resolve::Unknown;
         };
         if now_ms >= entry.expires_ms {
-            return Resolve::Expired;
+            return Resolve::Expired {
+                approval_id: entry.approval_id,
+            };
         }
         Resolve::Decide {
             approval_id: entry.approval_id,
@@ -364,7 +370,12 @@ mod tests {
         ));
         let p = t.prompt_for(CHAT, &row("a2", "d"), T0);
         let (y, _) = datas(&p);
-        assert_eq!(t.resolve(CHAT, &y, T0 + 900_000), Resolve::Expired);
+        assert_eq!(
+            t.resolve(CHAT, &y, T0 + 900_000),
+            Resolve::Expired {
+                approval_id: "a2".into()
+            }
+        );
         assert_eq!(t.resolve(CHAT, &y, T0 + 900_000), Resolve::Unknown);
     }
 
@@ -374,7 +385,12 @@ mod tests {
         let p = t.prompt_for(CHAT, &row("a1", "d"), T0 + 600_000);
         assert!(p.text.contains("5 minutes"));
         let (y, _) = datas(&p);
-        assert_eq!(t.resolve(CHAT, &y, T0 + 900_000), Resolve::Expired);
+        assert_eq!(
+            t.resolve(CHAT, &y, T0 + 900_000),
+            Resolve::Expired {
+                approval_id: "a1".into()
+            }
+        );
     }
 
     #[test]
@@ -384,7 +400,31 @@ mod tests {
         r.created_at_ms = T0 + 10_000_000;
         let p = t.prompt_for(CHAT, &r, T0);
         let (y, _) = datas(&p);
-        assert_eq!(t.resolve(CHAT, &y, T0 + 900_000), Resolve::Expired);
+        assert_eq!(
+            t.resolve(CHAT, &y, T0 + 900_000),
+            Resolve::Expired {
+                approval_id: "a1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_expired_press_names_the_pressed_approval() {
+        let mut t = ApprovalButtons::new();
+        let mut later = row("newer", "d");
+        later.created_at_ms = T0 + 500_000;
+        let (y_old, _) = datas(&t.prompt_for(CHAT, &row("older", "d"), T0));
+        let (y_new, _) = datas(&t.prompt_for(CHAT, &later, T0 + 500_000));
+        assert_eq!(
+            t.resolve(CHAT, &y_old, T0 + 900_000),
+            Resolve::Expired {
+                approval_id: "older".into()
+            }
+        );
+        assert!(matches!(
+            t.resolve(CHAT, &y_new, T0 + 900_000),
+            Resolve::Decide { approval_id, .. } if approval_id == "newer"
+        ));
     }
 
     #[test]

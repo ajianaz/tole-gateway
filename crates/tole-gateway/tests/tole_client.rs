@@ -73,16 +73,19 @@ async fn create_session_sends_only_the_given_fields() {
 async fn resume_session_sends_resume_and_optional_profile() {
     let (fake, client) = fake_with_token().await;
     fake.add_session("srv-9");
-    let open = client.resume_session("srv-9", None).await.unwrap();
+    let open = client.resume_session("srv-9", None, None).await.unwrap();
     assert!(open.resumed);
     assert_eq!(
         fake.last_request().unwrap().body,
         json!({"resume": "srv-9"})
     );
-    client.resume_session("srv-9", Some("p")).await.unwrap();
+    client
+        .resume_session("srv-9", Some("p"), Some("/w/proj"))
+        .await
+        .unwrap();
     assert_eq!(
         fake.last_request().unwrap().body,
-        json!({"resume": "srv-9", "profile": "p"})
+        json!({"resume": "srv-9", "cwd": "/w/proj", "profile": "p"})
     );
 }
 
@@ -599,7 +602,7 @@ async fn bad_ids_are_rejected_without_calling_the_server() {
             Err(ToleError::BadRequest(_))
         ));
         assert!(matches!(
-            client.resume_session(bad, None).await,
+            client.resume_session(bad, None, None).await,
             Err(ToleError::BadRequest(_))
         ));
     }

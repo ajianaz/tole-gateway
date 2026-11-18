@@ -34,6 +34,9 @@
 //! - Approvals: `add_approval(id, session, tool, description)` adds a pending
 //!   row; `approval_row(id)` reads it back; deciding changes its status.
 //!   `decisions()` lists `(approval id, "allow" | "deny")` in order.
+//! - `add_approval_at(...)` sets the row's creation time; `apply_decision_then_fail()`
+//!   makes decisions take effect but answer `500`. Entry pages honour `limit`
+//!   and `after` and report `hasMore`.
 //! - Failures: `fail(method, path, status, error_text)` makes that exact route
 //!   (decoded path, no query) answer the given status and `{"error": text}`;
 //!   `fail_with_body(...)` sends a raw body; `clear_failures()` removes them.
@@ -129,6 +132,8 @@ struct Inner {
     /// A prompt to an unknown session answers the real server's 500.
     unknown_prompt_500: bool,
     failures: Vec<(String, String, u16, String)>,
+    /// A decision is applied and then answered with a 500 (an ambiguous failure).
+    apply_then_fail: bool,
     decisions: Vec<(String, String)>,
     log: Vec<LoggedRequest>,
     next_session: u64,
@@ -248,6 +253,18 @@ impl FakeTole {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        self.add_approval_at(id, session, tool, description, now_ms)
+    }
+
+    /// Like [`FakeTole::add_approval`] with an explicit creation time.
+    pub fn add_approval_at(
+        &self,
+        id: &str,
+        session: &str,
+        tool: &str,
+        description: &str,
+        now_ms: u64,
+    ) -> Value {
         let row = json!({
             "id": id, "sessionId": session, "tool": tool,
             "description": description, "status": "pending",
@@ -255,6 +272,11 @@ impl FakeTole {
         });
         self.with(|s| s.approvals.push(row.clone()));
         row
+    }
+
+    /// Make every decision apply and then answer `500` (the caller cannot tell).
+    pub fn apply_decision_then_fail(&self) {
+        self.with(|s| s.apply_then_fail = true);
     }
 
     pub fn approval_row(&self, id: &str) -> Option<Value> {
@@ -553,6 +575,9 @@ fn route(s: &mut Inner, method: &str, seg: &[String], query: &str, body: &Value)
             let status = if allow { "approved" } else { "denied" };
             row["status"] = json!(status);
             s.decisions.push((id.to_string(), decision.to_string()));
+            if s.apply_then_fail {
+                return Routed::Now(500, json!({"error": "decision applied, answer lost"}));
+            }
             if allow {
                 Routed::Now(202, json!({"id": id, "status": status, "resuming": true}))
             } else {

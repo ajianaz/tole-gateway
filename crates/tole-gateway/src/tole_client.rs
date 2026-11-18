@@ -47,11 +47,13 @@ pub trait ToleApi: Send + Sync {
         cwd: Option<&str>,
     ) -> impl Future<Output = Result<SessionOpen, ToleError>> + Send;
 
-    /// `POST /sessions` `{resume}` with an optional profile.
+    /// `POST /sessions` `{resume}` with an optional profile and working
+    /// directory (tole looks for the session log under the working directory).
     fn resume_session(
         &self,
         session_id: &str,
         profile: Option<&str>,
+        cwd: Option<&str>,
     ) -> impl Future<Output = Result<SessionOpen, ToleError>> + Send;
 
     /// `POST /sessions/{id}/prompt`. Blocks for the whole turn.
@@ -397,10 +399,14 @@ impl ToleApi for HttpToleClient {
         &self,
         session_id: &str,
         profile: Option<&str>,
+        cwd: Option<&str>,
     ) -> Result<SessionOpen, ToleError> {
         check_id(session_id)?;
         let mut body = serde_json::Map::new();
         body.insert("resume".into(), json!(session_id));
+        if let Some(cwd) = cwd {
+            body.insert("cwd".into(), json!(cwd));
+        }
         if let Some(profile) = profile {
             body.insert("profile".into(), json!(profile));
         }
