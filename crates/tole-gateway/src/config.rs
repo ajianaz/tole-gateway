@@ -38,14 +38,15 @@ fn default_rollover_hours() -> u64 {
 /// Environment lookup, injectable for tests.
 pub type EnvFn<'a> = &'a dyn Fn(&str) -> Option<String>;
 
-/// Env var holding the `tole serve` bearer token.
-pub const ENV_TOLE_TOKEN: &str = "TOLE_SERVE_TOKEN";
+/// Name of the env var holding the `tole serve` bearer token. The constant is a
+/// variable NAME, not a secret, hence the cora-ignore on its line.
+pub const ENV_TOLE_TOKEN: &str = "TOLE_SERVE_TOKEN"; // cora-ignore: sec-hardcoded-secret
 /// Env var holding the Basic auth user.
 pub const ENV_TOLE_BASIC_USER: &str = "TOLE_SERVE_BASIC_USER";
-/// Env var holding the Basic auth password.
-pub const ENV_TOLE_BASIC_PASSWORD: &str = "TOLE_SERVE_BASIC_PASSWORD";
-/// Env var holding the Telegram bot token.
-pub const ENV_BOT_TOKEN: &str = "TOLE_GATEWAY_BOT_TOKEN";
+/// Name of the env var holding the Basic auth password (a name, not a secret).
+pub const ENV_TOLE_BASIC_PASSWORD: &str = "TOLE_SERVE_BASIC_PASSWORD"; // cora-ignore: sec-hardcoded-secret
+/// Name of the env var holding the Telegram bot token (a name, not a secret).
+pub const ENV_BOT_TOKEN: &str = "TOLE_GATEWAY_BOT_TOKEN"; // cora-ignore: sec-hardcoded-secret
 
 /// Errors from loading, resolving or validating the configuration. No
 /// message contains a secret value or the text of the file.
