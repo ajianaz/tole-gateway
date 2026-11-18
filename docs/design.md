@@ -1,7 +1,8 @@
 # tole-gateway design
 
-Status: G1 (bootstrap) in progress. This file records decisions and the
-roadmap; update it in the same PR that changes either.
+Status: the Telegram path (G2 and G3) is implemented and tested against fakes;
+not yet run against the real Telegram service. This file records decisions and
+the roadmap; update it in the same PR that changes either.
 
 ## 1. What it is
 
@@ -28,8 +29,9 @@ logic. Sessions, tools, approvals, budgets and storage stay in tole.
 
 ### Approvals
 
-- A pending approval is shown as inline buttons with the tool, the risk tier
-  and the redacted arguments.
+- A pending approval is shown as inline buttons with the tool and the one-line
+  redacted description from tole. The approval row carries no risk field: over
+  serve only Write-tier tools can be queued, so the message says so.
 - An unanswered approval is a denial.
 - Destructive tools are never approvable from chat. tole enforces this; the
   gateway offers no way around it.
@@ -56,8 +58,10 @@ logic. Sessions, tools, approvals, budgets and storage stay in tole.
   [codecoradev/tole#911](https://github.com/codecoradev/tole/issues/911)). The
   gateway therefore holds no SSE stream per session; the server caps streams at
   8.
-- Until that exists, the gateway polls `GET /approvals?session=` after every
-  allow and `GET /cron/runs`.
+- Until that exists, the gateway polls `GET /approvals?session=` and
+  `GET /sessions/{id}/status` after every allow, then reads the new log entries
+  for the answer (a resumed turn has no HTTP response). Polling `GET /cron/runs`
+  is not implemented yet.
 - Incoming deliveries are verified (signature and freshness) before anything
   is shown.
 
@@ -89,8 +93,8 @@ the binary.
 
 | Step | Scope | State |
 |------|-------|-------|
-| G1 | Repository bootstrap: workspace skeleton, CI and governance checks, docs. | in progress |
-| G2 | Telegram adapter: long polling, allowlist and pairing, one chat = one session, `/new`, 4-hour rollover. | planned |
-| G3 | Approvals from chat: inline buttons, denial on timeout, polling fallback. | planned |
+| G1 | Repository bootstrap: workspace skeleton, CI and governance checks, docs. | done |
+| G2 | Telegram adapter: long polling, allowlist and pairing, one chat = one session, `/new`, 4-hour rollover. | implemented, tested against fakes; live Telegram check pending |
+| G3 | Approvals from chat: inline buttons, denial on timeout, polling fallback. | implemented, tested against fakes |
 | G4 | Cron results and notifications through the signed webhook delivery target; second channel (Discord) and the adapter seam extraction. | planned |
 | G5 | Web dashboard. | later |
