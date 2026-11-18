@@ -611,3 +611,463 @@ fn valid_profile_name(n: &str) -> bool {
         && n.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_file_gets_the_documented_defaults() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.tole.url, "http://127.0.0.1:7801");
+        assert_eq!(cfg.tole.prompt_timeout_secs, 1800);
+        assert_eq!(cfg.telegram.api_base, "https://api.telegram.org");
+        assert_eq!(cfg.sessions.rollover_hours, 4);
+        assert!(cfg.auth.allowed_user_ids.is_empty());
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected() {
+        assert!(toml::from_str::<Config>("[tole]\nurll = \"x\"\n").is_err());
+    }
+
+    #[test]
+    fn debug_never_shows_secrets() {
+        let cfg: Config = toml::from_str("[telegram]\nbot_token = \"123:SECRET\"\n").unwrap();
+        assert!(!format!("{cfg:?}").contains("SECRET"));
+    }
+
+    use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let m: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| m.get(k).cloned()
+    }
+
+    fn cfg(text: &str) -> Config {
+        toml::from_str(text).unwrap()
+    }
+
+    fn token_file(dir: &tempfile::TempDir, name: &str, body: &str, mode: u32) -> PathBuf {
+        let p = dir.path().join(name);
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+        p
+    }
+
+    #[test]
+    fn load_reads_a_file_and_reports_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(&p, "[sessions]\nrollover_hours = 9\n").unwrap();
+        let c = Config::load_with_env(&p, &env_of(&[])).unwrap();
+        assert_eq!(c.sessions.rollover_hours, 9);
+        let missing = dir.path().join("nope.toml");
+        let e = Config::load(&missing).unwrap_err();
+        assert!(matches!(e, ConfigError::NotFound(_)));
+        assert!(e.to_string().contains("nope.toml"));
+    }
+
+    #[test]
+    fn toml_errors_have_line_and_column_but_no_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            "[telegram]\nbot_token = \"SECRETVALUE\"\npoll_timeout_secs = \"SECRETVALUE\"\n",
+        )
+        .unwrap();
+        let e = Config::load(&p).unwrap_err().to_string();
+        assert!(e.contains("line 3"), "{e}");
+        assert!(e.contains("column"), "{e}");
+        assert!(!e.contains("SECRETVALUE"), "{e}");
+    }
+
+    #[test]
+    fn bearer_precedence_is_env_then_file_then_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = token_file(&dir, "t", "from-file\n", 0o600);
+        let c = cfg(&format!(
+            "[tole]\ntoken = \"inline\"\ntoken_file = \"{}\"\n",
+            f.display()
+        ));
+        let auth = c
+            .tole_auth(&env_of(&[(ENV_TOLE_TOKEN, "from-env")]))
+            .unwrap();
+        assert_eq!(auth, ToleAuth::Bearer(Secret::new("from-env")));
+        let auth = c.tole_auth(&env_of(&[])).unwrap();
+        assert_eq!(auth, ToleAuth::Bearer(Secret::new("from-file")));
+        let c = cfg("[tole]\ntoken = \"inline\"\n");
+        assert_eq!(
+            c.tole_auth(&env_of(&[])).unwrap(),
+            ToleAuth::Bearer(Secret::new("inline"))
+        );
+    }
+
+    #[test]
+    fn basic_auth_from_env_or_file() {
+        let c = cfg("[tole]\nbasic_user = \"u\"\nbasic_password = \"p\"\n");
+        assert_eq!(
+            c.tole_auth(&env_of(&[])).unwrap(),
+            ToleAuth::Basic {
+                user: "u".into(),
+                password: Secret::new("p")
+            }
+        );
+        let e = env_of(&[(ENV_TOLE_BASIC_USER, "eu"), (ENV_TOLE_BASIC_PASSWORD, "ep")]);
+        assert_eq!(
+            c.tole_auth(&e).unwrap(),
+            ToleAuth::Basic {
+                user: "eu".into(),
+                password: Secret::new("ep")
+            }
+        );
+    }
+
+    #[test]
+    fn both_or_neither_scheme_is_an_error() {
+        let both = cfg("[tole]\ntoken = \"t\"\nbasic_user = \"u\"\nbasic_password = \"p\"\n");
+        assert!(matches!(
+            both.tole_auth(&env_of(&[])),
+            Err(ConfigError::Conflict(_))
+        ));
+        let none = cfg("");
+        assert!(matches!(
+            none.tole_auth(&env_of(&[])),
+            Err(ConfigError::Missing(_))
+        ));
+        let half = cfg("[tole]\nbasic_user = \"u\"\n");
+        assert!(matches!(
+            half.tole_auth(&env_of(&[])),
+            Err(ConfigError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn blank_values_are_errors() {
+        let c = cfg("[tole]\ntoken = \"t\"\n");
+        assert!(matches!(
+            c.tole_auth(&env_of(&[(ENV_TOLE_TOKEN, "  ")])),
+            Err(ConfigError::Blank { .. })
+        ));
+        assert!(matches!(
+            cfg("[tole]\ntoken = \"\"\n").tole_auth(&env_of(&[])),
+            Err(ConfigError::Blank { .. })
+        ));
+        assert!(matches!(
+            cfg("[telegram]\nbot_token = \" \"\n").bot_token(&env_of(&[])),
+            Err(ConfigError::Blank { .. })
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let f = token_file(&dir, "empty", "\n", 0o600);
+        let c = cfg(&format!(
+            "[telegram]\nbot_token_file = \"{}\"\n",
+            f.display()
+        ));
+        assert!(matches!(
+            c.bot_token(&env_of(&[])),
+            Err(ConfigError::Blank { .. })
+        ));
+    }
+
+    #[test]
+    fn bot_token_precedence_and_newline_trim() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = token_file(&dir, "bot", "123:file\r\n", 0o600);
+        let c = cfg(&format!(
+            "[telegram]\nbot_token = \"123:inline\"\nbot_token_file = \"{}\"\n",
+            f.display()
+        ));
+        assert_eq!(
+            c.bot_token(&env_of(&[(ENV_BOT_TOKEN, "123:env")])).unwrap(),
+            Secret::new("123:env")
+        );
+        assert_eq!(c.bot_token(&env_of(&[])).unwrap(), Secret::new("123:file"));
+        assert_eq!(
+            cfg("[telegram]\nbot_token = \"123:inline\"\n")
+                .bot_token(&env_of(&[]))
+                .unwrap(),
+            Secret::new("123:inline")
+        );
+        assert!(matches!(
+            cfg("").bot_token(&env_of(&[])),
+            Err(ConfigError::Missing(_))
+        ));
+    }
+
+    #[test]
+    fn token_files_must_not_be_group_or_world_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = token_file(&dir, "bot", "SECRETVALUE", 0o640);
+        let c = cfg(&format!(
+            "[telegram]\nbot_token_file = \"{}\"\n",
+            f.display()
+        ));
+        let e = c.bot_token(&env_of(&[])).unwrap_err();
+        assert!(matches!(e, ConfigError::InsecurePermissions { .. }));
+        let msg = e.to_string();
+        assert!(msg.contains("chmod 600"), "{msg}");
+        assert!(!msg.contains("SECRETVALUE"));
+    }
+
+    #[test]
+    fn a_missing_token_file_names_the_path() {
+        let c = cfg("[telegram]\nbot_token_file = \"/nonexistent/dir/tok\"\n");
+        let e = c.bot_token(&env_of(&[])).unwrap_err().to_string();
+        assert!(e.contains("/nonexistent/dir/tok"), "{e}");
+    }
+
+    #[test]
+    fn validate_accepts_defaults_and_an_empty_allowlist() {
+        cfg("").validate().unwrap();
+        cfg("[auth]\nallowed_user_ids = []\n").validate().unwrap();
+    }
+
+    #[test]
+    fn validate_reports_every_problem() {
+        let c = cfg(
+            "[tole]\nurl = \"ftp://x\"\nrequest_timeout_secs = 0\nprompt_timeout_secs = 0\n\
+             profile = \"Bad Name\"\n[telegram]\napi_base = \"nope\"\npoll_timeout_secs = 99\n\
+             [auth]\nallowed_user_ids = [1, -5, 0]\npairing_ttl_secs = 5\n\
+             [sessions]\nrollover_hours = 0\n",
+        );
+        let Err(ConfigError::Invalid(p)) = c.validate() else {
+            panic!("expected Invalid");
+        };
+        assert_eq!(p.len(), 9, "{p:?}");
+        let text = ConfigError::Invalid(p).to_string();
+        assert!(text.contains("tole.url") && text.contains("rollover_hours"));
+    }
+
+    #[test]
+    fn profile_name_rule() {
+        assert!(valid_profile_name("work_1-a"));
+        assert!(!valid_profile_name(""));
+        assert!(!valid_profile_name("Upper"));
+        assert!(!valid_profile_name(&"a".repeat(65)));
+        assert!(valid_profile_name(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn state_dir_precedence() {
+        let c = cfg("state_dir = \"/srv/gw\"\n");
+        assert_eq!(
+            c.state_dir(&env_of(&[("XDG_STATE_HOME", "/x")])).unwrap(),
+            PathBuf::from("/srv/gw")
+        );
+        let c = cfg("");
+        assert_eq!(
+            c.state_dir(&env_of(&[("XDG_STATE_HOME", "/x"), ("HOME", "/h")]))
+                .unwrap(),
+            PathBuf::from("/x/tole-gateway")
+        );
+        assert_eq!(
+            c.state_dir(&env_of(&[("HOME", "/h")])).unwrap(),
+            PathBuf::from("/h/.local/state/tole-gateway")
+        );
+        assert!(c.state_dir(&env_of(&[])).is_err());
+    }
+
+    fn problems(text: &str) -> Vec<String> {
+        match cfg(text).validate() {
+            Err(ConfigError::Invalid(p)) => p,
+            Ok(()) => vec![],
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn urls_with_userinfo_or_no_host_are_rejected_without_echo() {
+        for u in [
+            "http://user:PWSECRET@127.0.0.1:7801",
+            "https://tok@example.com",
+        ] {
+            let p = problems(&format!("[tole]\nurl = \"{u}\"\n"));
+            assert_eq!(p.len(), 1, "{p:?}");
+            assert!(p[0].contains("token"), "{p:?}");
+            assert!(
+                !p[0].contains("PWSECRET") && !p[0].contains("tok@"),
+                "{p:?}"
+            );
+            let p = problems(&format!("[telegram]\napi_base = \"{u}\"\n"));
+            assert_eq!(p.len(), 1, "{p:?}");
+        }
+        for u in ["http://:80", "http://@/", "https://"] {
+            assert_eq!(
+                problems(&format!("[tole]\nurl = \"{u}\"\n")).len(),
+                1,
+                "{u}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_http_is_only_allowed_on_loopback() {
+        for u in [
+            "http://localhost:7801",
+            "http://127.0.0.1:7801",
+            "http://127.5.6.7",
+            "http://[::1]:7801",
+            "https://10.0.0.5:7801",
+            "https://example.com",
+        ] {
+            assert!(
+                problems(&format!("[tole]\nurl = \"{u}\"\n")).is_empty(),
+                "{u}"
+            );
+            assert!(
+                problems(&format!("[telegram]\napi_base = \"{u}\"\n")).is_empty(),
+                "{u}"
+            );
+        }
+        for u in [
+            "http://10.0.0.5:7801",
+            "http://example.com",
+            "http://[2001:db8::1]",
+        ] {
+            let p = problems(&format!("[tole]\nurl = \"{u}\"\n"));
+            assert_eq!(p.len(), 1, "{u}");
+            assert!(p[0].contains("https"), "{p:?}");
+            let p = problems(&format!("[telegram]\napi_base = \"{u}\"\n"));
+            assert_eq!(p.len(), 1, "{u}");
+        }
+    }
+
+    #[test]
+    fn token_files_must_be_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = cfg(&format!(
+            "[telegram]\nbot_token_file = \"{}\"\n",
+            dir.path().display()
+        ));
+        let e = c.bot_token(&env_of(&[])).unwrap_err();
+        assert!(e.to_string().contains("not a regular file"), "{e}");
+        let c = cfg("[telegram]\nbot_token_file = \"/dev/null\"\n");
+        let e = c.bot_token(&env_of(&[])).unwrap_err();
+        assert!(e.to_string().contains("not a regular file"), "{e}");
+    }
+
+    #[test]
+    fn token_files_are_size_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = token_file(&dir, "ok", &"a".repeat(4096), 0o600);
+        let big = token_file(&dir, "big", &"a".repeat(4097), 0o600);
+        let at = |p: &PathBuf| {
+            cfg(&format!(
+                "[telegram]\nbot_token_file = \"{}\"\n",
+                p.display()
+            ))
+            .bot_token(&env_of(&[]))
+        };
+        assert!(at(&ok).is_ok());
+        let e = at(&big).unwrap_err().to_string();
+        assert!(e.contains("larger than 4 KiB"), "{e}");
+    }
+
+    #[test]
+    fn token_files_owned_by_another_user_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = token_file(&dir, "t", "secret", 0o600);
+        let me = current_uid().expect("uid");
+        if std::os::unix::fs::chown(&f, Some(me.wrapping_add(1)), None).is_err() {
+            return; // not allowed to chown (not root); nothing to test
+        }
+        let c = cfg(&format!(
+            "[telegram]\nbot_token_file = \"{}\"\n",
+            f.display()
+        ));
+        let e = c.bot_token(&env_of(&[])).unwrap_err().to_string();
+        assert!(e.contains("owned by another user"), "{e}");
+    }
+
+    fn write_cfg(dir: &tempfile::TempDir, body: &str, mode: u32) -> PathBuf {
+        token_file(dir, "gateway.toml", body, mode)
+    }
+
+    #[test]
+    fn config_with_inline_secrets_must_not_be_group_or_world_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        for body in [
+            "[telegram]\nbot_token = \"123:SECRETVALUE\"\n",
+            "[tole]\ntoken = \"SECRETVALUE\"\n",
+            "[tole]\nbasic_user = \"u\"\nbasic_password = \"SECRETVALUE\"\n",
+        ] {
+            let p = write_cfg(&dir, body, 0o644);
+            let e = Config::load(&p).unwrap_err();
+            assert!(
+                matches!(e, ConfigError::InsecurePermissions { .. }),
+                "{body}"
+            );
+            let msg = e.to_string();
+            assert!(
+                msg.contains("chmod 600") && !msg.contains("SECRETVALUE"),
+                "{msg}"
+            );
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+            Config::load(&p).unwrap();
+        }
+        // No inline secret: unrestricted.
+        let p = write_cfg(&dir, "[sessions]\nrollover_hours = 2\n", 0o644);
+        Config::load(&p).unwrap();
+    }
+
+    #[test]
+    fn secrets_are_trimmed_from_every_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = token_file(&dir, "t", "  from-file \t\n", 0o600);
+        let c = cfg(&format!("[tole]\ntoken_file = \"{}\"\n", f.display()));
+        assert_eq!(
+            c.tole_auth(&env_of(&[])).unwrap(),
+            ToleAuth::Bearer(Secret::new("from-file"))
+        );
+        let c = cfg("[tole]\ntoken = \" inline \"\n");
+        assert_eq!(
+            c.tole_auth(&env_of(&[])).unwrap(),
+            ToleAuth::Bearer(Secret::new("inline"))
+        );
+        assert_eq!(
+            c.tole_auth(&env_of(&[(ENV_TOLE_TOKEN, "\tenv  ")]))
+                .unwrap(),
+            ToleAuth::Bearer(Secret::new("env"))
+        );
+        let c = cfg("[tole]\nbasic_user = \"u\"\nbasic_password = \" p \"\n");
+        assert_eq!(
+            c.tole_auth(&env_of(&[])).unwrap(),
+            ToleAuth::Basic {
+                user: "u".into(),
+                password: Secret::new("p")
+            }
+        );
+        assert_eq!(
+            cfg("[telegram]\nbot_token = \" 1:a \"\n")
+                .bot_token(&env_of(&[]))
+                .unwrap(),
+            Secret::new("1:a")
+        );
+    }
+
+    #[test]
+    fn no_error_contains_a_planted_secret() {
+        let secret = "PLANTED-SECRET-123";
+        let dir = tempfile::tempdir().unwrap();
+        let f = token_file(&dir, "t", secret, 0o644);
+        let c = cfg(&format!(
+            "[tole]\ntoken = \"{secret}\"\nbasic_user = \"u\"\nbasic_password = \"{secret}\"\n\
+             url = \"bad\"\n[telegram]\nbot_token_file = \"{}\"\n",
+            f.display()
+        ));
+        let errs = [
+            c.tole_auth(&env_of(&[])).unwrap_err().to_string(),
+            c.bot_token(&env_of(&[])).unwrap_err().to_string(),
+            c.validate().unwrap_err().to_string(),
+            format!("{c:?}"),
+        ];
+        for e in errs {
+            assert!(!e.contains(secret), "{e}");
+        }
+    }
+}
