@@ -65,6 +65,7 @@ file without inline secrets has no mode requirement.
 of the Bot API path) would cross the network in clear text. If the gateway must
 reach serve on another host, put it behind a TLS-terminating proxy or an SSH
 tunnel and use an `https://` URL or a loopback URL. URLs must not embed
-credentials (`http://user:pass@host`); use the token keys instead.
+a user name or password (the `user:password@` part before the host); use the token
+keys instead.
 
 Secrets are never printed: errors and `Debug` output show `***` or omit them.
