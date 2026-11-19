@@ -12,14 +12,16 @@ decided through tole's single gate (`POST /approvals/{id}/decision`).
 | --- | --- |
 | `approval_requested` | After an Allow, an approval raised by the resumed turn is shown with its buttons at once, without polling `GET /approvals?session=`. The summary is untrusted text, shown as plain text. |
 | `approval_resolved` | Remembered, so a late or reordered `approval_requested` for an approval that already closed is dropped (events carry no order). |
+| `turn_finished` | Verified like every event, then its ids are checked (the `id` must be `turn:<session>:<hash16>:<last_seq>[:<settle>]` for the `session_id` and `last_seq` in `data`), and the latest end of each session is kept by `(last_seq, at, settle)` (`at` is the envelope time; the settle counter restarts with tole, so it only breaks a tie), so a late older event never replaces a newer one, also across a tole restart. It carries no text. A status or code word the gateway does not know yet is kept as "other" and acknowledged. Not yet used by the dispatcher. |
 | `cron_run_finished`, `webhook_test`, anything else | Acknowledged (`200`) and ignored: the gateway has no cron presentation yet. |
 
-tole sends **no "turn finished" event**, and the event carries a pointer, not
-the assistant's answer. So the gateway still reads `GET /sessions/{id}/status`
-and the log entries after an Allow to find the answer; what the receiver removes
-is the polling for approvals. While it is on, the open approvals are polled only
-every `fallback_poll_secs` (default 15) in case an event was lost. When the
-receiver is off, nothing changes from the polling behaviour.
+An event carries a pointer, not the assistant's answer. tole's `turn_finished`
+is received and recorded, but the dispatcher does not act on it yet, so the
+gateway still reads `GET /sessions/{id}/status` and the log entries after an
+Allow to find the answer; what the receiver removes is the polling for
+approvals. While it is on, the open approvals are polled only every
+`fallback_poll_secs` (default 15) in case an event was lost. When the receiver
+is off, nothing changes from the polling behaviour.
 
 ## Configure the gateway
 
@@ -70,7 +72,10 @@ anyone on the path.
 
 1. Not `POST <path>`: `404`. More than 16 requests in flight: `503`.
 2. The body is read under a hard cap (`max_body_bytes`, also for chunked
-   bodies) and a 10 second deadline: `413` / `408`.
+   bodies) and a 10 second deadline: `413` / `408`. A request whose
+   `X-Tole-Event` says `turn_finished` is capped at 2 KiB (tole never sends one
+   over 1 KiB); a request that lies about its event to get the larger cap fails
+   the signature in the next step.
 3. The four headers `X-Tole-Timestamp`, `X-Tole-Delivery`, `X-Tole-Event`,
    `X-Tole-Signature` must be present and well formed; the v2 signature
    `HMAC-SHA256(key, "v2\n<ts>\n<id>\n<event>\n<raw body>")` is compared in

@@ -1,5 +1,6 @@
 //! What verified deliveries leave behind for the app: approvals tole announced
-//! (so a watcher need not poll for them) and which approvals already closed.
+//! (so a watcher need not poll for them), which approvals already closed, and
+//! the latest settled turn of each session (`turn_finished`).
 //!
 //! Bounded and in memory. Nothing here is ever an authority: a notified
 //! approval is shown with the same buttons as a polled one and is decided only
@@ -11,10 +12,13 @@ use std::sync::Mutex;
 
 use tokio::sync::watch;
 
+use super::turn::TurnFinished;
 use crate::types::{ApprovalRow, ApprovalStatus};
 
 const MAX_REQUESTED: usize = 64;
 const MAX_RESOLVED: usize = 256;
+/// Sessions whose latest turn end is remembered.
+const MAX_TURNS: usize = 256;
 /// Longest approval life tole uses (`EXPIRY_SECS`).
 const MAX_LIFE_SECS: u64 = 900;
 
@@ -39,6 +43,8 @@ pub struct Requested {
 struct State {
     requested: VecDeque<Requested>,
     resolved: VecDeque<String>,
+    /// The latest turn end per session, oldest session first.
+    turns: VecDeque<TurnFinished>,
 }
 
 /// Shared between the receiver (writer) and the app (reader).
@@ -151,5 +157,35 @@ impl NotifyHub {
     /// True when the approval was reported closed.
     pub fn is_resolved(&self, approval_id: &str) -> bool {
         self.lock().resolved.iter().any(|x| x == approval_id)
+    }
+
+    /// Record a settled turn. Only the latest end of a session is kept, by
+    /// `(last_seq, at, settle)` ([`TurnFinished::position`]): events carry no order on the wire, so an older one
+    /// that arrives late is dropped here (tole `docs/turn-finished-event.md`
+    /// section 7).
+    pub fn record_turn(&self, t: TurnFinished) {
+        {
+            let mut s = self.lock();
+            if let Some(pos) = s.turns.iter().position(|x| x.session_id == t.session_id) {
+                if s.turns[pos].position() >= t.position() {
+                    return;
+                }
+                s.turns.remove(pos);
+            } else if s.turns.len() >= MAX_TURNS {
+                s.turns.pop_front();
+            }
+            s.turns.push_back(t);
+        }
+        self.bump();
+    }
+
+    /// The latest recorded turn end of `session`, if any. It is a hint: the
+    /// caller decides against its own cursor whether it is new.
+    pub fn latest_turn(&self, session: &str) -> Option<TurnFinished> {
+        self.lock()
+            .turns
+            .iter()
+            .find(|x| x.session_id == session)
+            .cloned()
     }
 }

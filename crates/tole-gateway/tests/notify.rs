@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tole_gateway::config::{Config, ConfigError, ENV_WEBHOOK_KEY};
-use tole_gateway::notify::{sign, NotifyHub, Receiver, ReceiverConfig};
+use tole_gateway::notify::{
+    sign, NotifyHub, Receiver, ReceiverConfig, TurnCode, TurnStatus, MAX_TURN_BODY,
+};
 use tole_gateway::secret::Secret;
 
 const KEY: &str = "tole-test-key-0123456789abcdef";
@@ -308,6 +310,149 @@ async fn other_paths_and_methods_are_a_plain_404() {
         assert_eq!(resp.status().as_u16(), 404, "{m} {p}");
         assert_eq!(resp.text().await.unwrap(), "");
     }
+}
+
+// -------------------------------------------------------- turn_finished
+
+/// tole's second pinned vector (`webhook_out/turn_tests.rs`): these exact bytes
+/// signed with [`KEY`] at [`NOW`].
+const TURN_ID: &str = "turn:s-1f2e3d:357319c7c674b505:14:1";
+const TURN_BODY: &str = r#"{"at":1795000000,"data":{"last_seq":14,"session_id":"s-1f2e3d","status":"completed"},"destination":"gateway","id":"turn:s-1f2e3d:357319c7c674b505:14:1","type":"turn_finished","v":1}"#;
+const TURN_SIG: &str = "v2=40b6e20fcf55ad9521b43149ff2314ff1c852b65d8e1463d3b1d23c84270c168";
+
+/// A `turn_finished` body for `session` "s-1f2e3d" at `(last_seq, settle)`.
+fn turn(last_seq: u64, settle: u64, data: Value) -> (String, Vec<u8>) {
+    turn_at(last_seq, settle, NOW, data)
+}
+
+/// [`turn`] with the envelope `at` set.
+fn turn_at(last_seq: u64, settle: u64, at: u64, data: Value) -> (String, Vec<u8>) {
+    let id = format!("turn:s-1f2e3d:357319c7c674b505:{last_seq}:{settle}");
+    let mut d = json!({"session_id": "s-1f2e3d", "status": "completed", "last_seq": last_seq});
+    for (k, v) in data.as_object().unwrap() {
+        d[k] = v.clone();
+    }
+    let body = json!({"v": 1, "id": id, "type": "turn_finished", "destination": "gateway",
+                      "at": at, "data": d});
+    (id, serde_json::to_vec(&body).unwrap())
+}
+
+#[tokio::test]
+async fn the_pinned_turn_finished_vector_is_accepted_and_recorded() {
+    let r = rig().await;
+    let ts = NOW.to_string();
+    assert_eq!(
+        sign(
+            &Secret::new(KEY),
+            &ts,
+            TURN_ID,
+            "turn_finished",
+            TURN_BODY.as_bytes()
+        ),
+        TURN_SIG
+    );
+    let mut q = Req::signed(TURN_ID, "turn_finished", TURN_BODY.as_bytes(), NOW);
+    q.sig = Some(TURN_SIG.into());
+    assert_eq!(send(&r, &q).await, (200, String::new()));
+    let t = r.hub.latest_turn("s-1f2e3d").unwrap();
+    assert_eq!(
+        (t.status, t.last_seq, t.settle),
+        (TurnStatus::Completed, 14, 1)
+    );
+    assert!(r.hub.latest_turn("s-other").is_none());
+}
+
+#[tokio::test]
+async fn a_late_older_turn_end_does_not_replace_a_newer_one() {
+    let r = rig().await;
+    let post = |seq, settle, data: Value| {
+        let (id, body) = turn(seq, settle, data);
+        Req::signed(&id, "turn_finished", &body, NOW)
+    };
+    let pending = json!({"status": "approval_pending", "approval_id": "apr-1"});
+    assert_eq!(send(&r, &post(15, 2, json!({}))).await.0, 200);
+    assert_eq!(send(&r, &post(14, 1, pending.clone())).await.0, 200);
+    let t = r.hub.latest_turn("s-1f2e3d").unwrap();
+    assert_eq!((t.status, t.last_seq), (TurnStatus::Completed, 15));
+    // The same position with a higher settle counter is a later settle (a
+    // turn that failed before it appended anything).
+    let failed = json!({"status": "failed", "code": "provider"});
+    assert_eq!(send(&r, &post(15, 3, failed)).await.0, 200);
+    let t = r.hub.latest_turn("s-1f2e3d").unwrap();
+    assert_eq!(
+        (t.status, t.code),
+        (TurnStatus::Failed, Some(TurnCode::Provider))
+    );
+}
+
+#[tokio::test]
+async fn after_a_tole_restart_a_lower_settle_at_the_same_last_seq_is_still_newer() {
+    let r = rig().await;
+    let post = |settle, at, data: Value| {
+        let (id, body) = turn_at(15, settle, at, data);
+        Req::signed(&id, "turn_finished", &body, NOW)
+    };
+    // The old process left settle 5; the restarted one counts from 1 again.
+    assert_eq!(send(&r, &post(5, NOW - 60, json!({}))).await.0, 200);
+    let failed = json!({"status": "failed", "code": "storage"});
+    assert_eq!(send(&r, &post(1, NOW, failed)).await.0, 200);
+    let t = r.hub.latest_turn("s-1f2e3d").unwrap();
+    assert_eq!((t.status, t.settle), (TurnStatus::Failed, 1));
+    // A retry of the old process's event, arriving late, stays older.
+    let late = json!({"status": "cancelled"});
+    assert_eq!(send(&r, &post(4, NOW - 90, late)).await.0, 200);
+    assert_eq!(
+        r.hub.latest_turn("s-1f2e3d").unwrap().status,
+        TurnStatus::Failed
+    );
+}
+
+#[tokio::test]
+async fn a_turn_finished_body_gets_the_tight_cap_whatever_the_config_says() {
+    let r = rig().await;
+    let (id, body) = turn(14, 1, json!({"padding": "x".repeat(MAX_TURN_BODY)}));
+    let (status, text) = send(&r, &Req::signed(&id, "turn_finished", &body, NOW)).await;
+    assert_eq!((status, text.as_str()), (413, ""));
+    assert!(r.hub.latest_turn("s-1f2e3d").is_none());
+}
+
+#[tokio::test]
+async fn a_turn_finished_that_disagrees_with_its_id_is_refused() {
+    let r = rig().await;
+    let (id, body) = turn(14, 1, json!({"last_seq": 15}));
+    assert_eq!(
+        send(&r, &Req::signed(&id, "turn_finished", &body, NOW))
+            .await
+            .0,
+        400
+    );
+    let (id, body) = turn(14, 1, json!({"session_id": "s-other"}));
+    assert_eq!(
+        send(&r, &Req::signed(&id, "turn_finished", &body, NOW))
+            .await
+            .0,
+        400
+    );
+    let (id, body) = turn(14, 1, json!({"approval_id": "not an id"}));
+    assert_eq!(
+        send(&r, &Req::signed(&id, "turn_finished", &body, NOW))
+            .await
+            .0,
+        400
+    );
+    assert!(r.hub.latest_turn("s-1f2e3d").is_none());
+    // A status word tole adds later is acknowledged, so tole stops retrying.
+    let (id, body) = turn(16, 1, json!({"status": "paused"}));
+    assert_eq!(
+        send(&r, &Req::signed(&id, "turn_finished", &body, NOW))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        r.hub.latest_turn("s-1f2e3d").unwrap().status,
+        TurnStatus::Other
+    );
 }
 
 // ------------------------------------------------------------- defaults
