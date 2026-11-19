@@ -29,7 +29,8 @@ means pairing mode.
 false), `listen` (default `127.0.0.1:7811`; loopback unless `allow_non_loopback`
 is true), `path` (default `/tole/events`), `destination` (default `gateway`,
 `[a-z0-9_-]{1,32}`), `hmac_key_file`, `max_body_bytes` (default 65536, 1024 to
-1048576), `fallback_poll_secs` (default 15, 1 to 3600). The rules are checked
+1048576), `fallback_poll_secs` (default 15, 1 to 3600; how often a resumed turn is
+polled while no event arrives). The rules are checked
 only when `enabled` is true.
 
 Validation reports all problems in a single error, one per line.

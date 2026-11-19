@@ -55,7 +55,8 @@ pub struct NotifyHub {
 }
 
 impl NotifyHub {
-    /// A hub; `fallback_poll` is how often a watcher still polls approvals.
+    /// A hub; `fallback_poll` is how often a watcher still polls a resumed
+    /// turn (approvals, status, log) while no event arrives.
     pub fn new(fallback_poll: std::time::Duration) -> Self {
         Self {
             state: Mutex::new(State::default()),
@@ -64,7 +65,7 @@ impl NotifyHub {
         }
     }
 
-    /// The approval poll cadence while the receiver is on.
+    /// The fallback poll cadence while the receiver is on.
     pub fn fallback_poll(&self) -> std::time::Duration {
         self.fallback_poll
     }

@@ -27,8 +27,8 @@ Telegram  <--long polling-->  tole-gateway  <--HTTP, loopback-->  tole serve
   buttons. The decision goes through tole's single approval gate. An approval
   you do not answer is denied.
 - Optionally (`[notify]`, off by default) tole's signed outbound webhooks tell
-  the gateway about approvals raised by a resumed turn, so it need not poll for
-  them; polling remains the fallback.
+  the gateway about approvals raised by a resumed turn and about the end of
+  that turn, so it need not poll for them; polling remains the slow fallback.
 - A new session starts after 4 hours without a message from you, or on `/new`.
 - Only chats on the allowlist, or one that has just entered the one-time
   pairing code, reach tole. Everyone else gets no reply at all.

@@ -8,10 +8,12 @@
 //! - After an allow the resumed turn has no HTTP answer, so the app polls
 //!   `GET /approvals?session=` and `GET /sessions/{id}/status` until the
 //!   session is idle and then reads the new log entries for the final answer.
-//!   With the webhook receiver on ([`crate::notify`]) an approval the resumed
-//!   turn raises arrives as a signed event and is shown without polling for
-//!   it; the open approvals are then polled only as a slow fallback, and the
-//!   status and log reads stay (tole sends no "turn finished" event).
+//!   With the webhook receiver on ([`crate::notify`]) the wait is event-driven:
+//!   an approval the resumed turn raises arrives as `approval_requested`, and
+//!   the turn's end as `turn_finished`, after which the app reads the log once
+//!   from its own cursor. Events are hints (volatile in tole, lost on a serve
+//!   restart), so the status, log and approval polls stay as a slow fallback
+//!   every `fallback_poll_secs`.
 //! - One turn at a time per chat. A message that arrives while a turn runs or
 //!   an approval is pending is answered with a short notice, never queued.
 //! - Chats that are not authorized get no reply at all, except that an unknown
@@ -30,7 +32,7 @@ use crate::auth::{Authorizer, PairOutcome, PairingCode, PairingCodeSource};
 use crate::channel::{ChatId, ChatPort, ChatSource, Inbound, MessageRef, UserId};
 use crate::config::Config;
 use crate::error::{ChatError, ToleError};
-use crate::notify::NotifyHub;
+use crate::notify::{NotifyHub, TurnCode, TurnFinished, TurnStatus};
 use crate::sessions::{can_force_new, plan, Clock, NewReason, Plan, SessionIndex};
 use crate::tole_client::ToleApi;
 use crate::types::{ApprovalRow, ApprovalStatus, Decision, PromptOutcome};
@@ -205,6 +207,70 @@ fn reply_text(stop_reason: &str, text: Option<&str>) -> String {
             other => format!("The turn stopped ({}) without an answer.", cap(other, 40)),
         },
     }
+}
+
+/// The fixed line for a turn end that has no answer to show. The words come
+/// from the gateway, never from the event (which carries no text).
+fn turn_end_text(status: TurnStatus, code: Option<TurnCode>) -> Option<&'static str> {
+    Some(match (status, code) {
+        (TurnStatus::Cancelled, _) => "The turn was cancelled.",
+        (TurnStatus::Detached, _) => "The turn was detached.",
+        (TurnStatus::BudgetExhausted, _) => "The turn stopped: its budget ran out.",
+        (TurnStatus::Failed, Some(TurnCode::Provider)) => {
+            "The turn failed: the model provider returned an error."
+        }
+        (TurnStatus::Failed, Some(TurnCode::Storage)) => {
+            "The turn failed: tole could not write the session log."
+        }
+        (TurnStatus::Failed, _) => "The turn failed inside tole.",
+        (TurnStatus::Blocked, Some(TurnCode::Loop)) => {
+            "The turn was stopped: it kept repeating the same tool call."
+        }
+        (TurnStatus::Blocked, Some(TurnCode::UnknownTool)) => {
+            "The turn was stopped: the model asked for a tool that does not exist."
+        }
+        (TurnStatus::Blocked, Some(TurnCode::StopGate)) => "The turn was stopped by a stop gate.",
+        (TurnStatus::Blocked, Some(TurnCode::Approval)) => {
+            "The turn stopped: a call needed an approval that was not granted."
+        }
+        (TurnStatus::Blocked, _) => "The turn was stopped by tole.",
+        (TurnStatus::Completed | TurnStatus::ApprovalPending | TurnStatus::Other, _) => {
+            return None
+        }
+    })
+}
+
+/// Whether a recorded turn end belongs to the leg that started after the
+/// allow whose log position was `baseline`. A later leg has a larger
+/// `last_seq`. At the same position only one stale event is possible: the
+/// leg that stopped on the approval just decided (`ignore`); anything else
+/// there is a resumed leg that ended before appending (tole D10).
+fn is_new_turn_end(t: &TurnFinished, baseline: u64, ignore: &[String]) -> bool {
+    match t.last_seq.cmp(&baseline) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => {
+            !(t.status == TurnStatus::ApprovalPending
+                && t.approval_id.as_ref().is_none_or(|a| ignore.contains(a)))
+        }
+    }
+}
+
+/// The state of one wait for a resumed turn.
+struct Watch {
+    started: Instant,
+    /// The log position read so far.
+    cursor: Option<u64>,
+    seen_busy: bool,
+    last_text: Option<String>,
+}
+
+/// How handling a `turn_finished` hint went.
+enum Hint {
+    /// The chat got its answer or its next approval.
+    Done,
+    /// The hint could not be used; the polls decide.
+    Fallback,
 }
 
 /// True when tole does not know the session. A prompt to a session the server
@@ -963,6 +1029,11 @@ where
 
     /// After an allow: wait for the resumed turn, then deliver its answer, or
     /// show the next approval if the turn stopped on one.
+    ///
+    /// Without the receiver the session is polled every `poll_interval`. With
+    /// it, a verified event wakes the wait: an announced approval is shown, a
+    /// `turn_finished` past the baseline ends it with one log read. If none
+    /// arrives, the same polls run every `fallback_poll` instead.
     async fn watch_resume(
         &self,
         chat: ChatId,
@@ -970,104 +1041,43 @@ where
         baseline: Option<u64>,
         ignore: &[String],
     ) {
-        let started = Instant::now();
-        let mut cursor = baseline;
-        let mut seen_busy = false;
-        let mut last_text: Option<String> = None;
+        let mut w = Watch {
+            started: Instant::now(),
+            cursor: baseline,
+            seen_busy: false,
+            last_text: None,
+        };
         let mut wake = self.notify.as_ref().map(|h| h.subscribe());
-        let mut last_approval_poll = Instant::now();
+        let poll_every = self
+            .notify
+            .as_ref()
+            .map_or(self.settings.poll_interval, |h| {
+                h.fallback_poll().max(self.settings.poll_interval)
+            });
+        let mut next_poll = w.started + poll_every;
+        // The position of the last hint tried, so a failed one is not retried
+        // in a loop; a newer event still is.
+        let mut tried: Option<(u64, u64)> = None;
         loop {
-            // A recorded event ends the wait early; the interval is the
-            // fallback when none arrives.
-            match wake.as_mut() {
-                Some(w) => {
-                    tokio::select! {
-                        _ = tokio::time::sleep(self.settings.poll_interval) => {}
-                        _ = w.changed() => {}
-                    }
-                }
-                None => tokio::time::sleep(self.settings.poll_interval).await,
-            }
             if let Some(row) = self.notified_approval(sid, ignore) {
                 return self.show_approval(chat, sid, &row).await;
             }
-            // With the receiver on, open approvals are polled only as a slow
-            // fallback; without it, every round.
-            let poll_approvals = self
-                .notify
-                .as_ref()
-                .is_none_or(|h| last_approval_poll.elapsed() >= h.fallback_poll());
-            if poll_approvals {
-                last_approval_poll = Instant::now();
-                match self.next_pending(sid, ignore).await {
-                    Ok(Some(row)) => return self.show_approval(chat, sid, &row).await,
-                    Ok(None) => {}
-                    Err(e) if e.is_retryable() => debug!("transient error while watching: {e}"),
-                    Err(e) => return self.report(chat, &Fail::Tole(e)).await,
-                }
-            }
-            // Status first, then the log: when the status says idle, the log
-            // read that follows already holds the final answer.
-            let busy = match self.tole.status(sid).await {
-                Ok(st) => st.busy,
-                Err(e) if e.is_retryable() => {
-                    debug!("transient error while watching: {e}");
-                    true
-                }
-                Err(e) => return self.report(chat, &Fail::Tole(e)).await,
-            };
-            if let Some(c) = cursor {
-                // While busy one page per poll is enough; once idle, read on
-                // until the end so the last answer is not a mid-turn one.
-                let mut at = c;
-                for _ in 0..MAX_IDLE_PAGES {
-                    match self.tole.entries(sid, at, 100).await {
-                        Ok(page) => {
-                            for e in &page.entries {
-                                if let Some(("assistant", t)) = e.message() {
-                                    last_text = Some(t.to_owned());
-                                }
-                            }
-                            let next = page.next_after.max(at);
-                            let more = page.has_more && next > at;
-                            at = next;
-                            cursor = Some(at);
-                            if busy || !more {
-                                break;
-                            }
-                        }
-                        Err(e) if e.is_retryable() => {
-                            debug!("transient error while reading: {e}");
-                            break;
-                        }
-                        Err(e) => return self.report(chat, &Fail::Tole(e)).await,
+            if let Some(t) = self.new_turn_end(sid, baseline, ignore) {
+                if tried != Some(t.position()) {
+                    tried = Some(t.position());
+                    if let Hint::Done = self.finish_from_hint(chat, sid, w.cursor, ignore, &t).await
+                    {
+                        return;
                     }
                 }
             }
-            if busy {
-                seen_busy = true;
-            } else if last_text.is_some()
-                || seen_busy
-                || started.elapsed() >= self.settings.resume_grace
-            {
-                // The turn may have parked on another approval in the instant
-                // between the two reads above. An announced one comes first.
-                if let Some(row) = self.notified_approval(sid, ignore) {
-                    return self.show_approval(chat, sid, &row).await;
+            if Instant::now() >= next_poll {
+                next_poll = Instant::now() + poll_every;
+                if self.poll_round(chat, sid, &mut w, ignore).await {
+                    return;
                 }
-                if let Ok(Some(row)) = self.next_pending(sid, ignore).await {
-                    return self.show_approval(chat, sid, &row).await;
-                }
-                let msg = match (last_text, cursor) {
-                    (Some(t), _) => t,
-                    (None, None) => "The action was allowed and is running or done, but I could \
-                                     not read its answer. Use /status."
-                        .to_owned(),
-                    (None, Some(_)) => "The action finished without a text answer.".to_owned(),
-                };
-                return self.say(chat, &msg).await;
             }
-            if started.elapsed() >= self.settings.watch_timeout {
+            if w.started.elapsed() >= self.settings.watch_timeout {
                 return self
                     .say(
                         chat,
@@ -1076,6 +1086,187 @@ where
                     )
                     .await;
             }
+            // A recorded event ends the wait early; the next poll is the
+            // fallback when none arrives.
+            let until = tokio::time::Instant::from_std(next_poll);
+            match wake.as_mut() {
+                Some(rx) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(until) => {}
+                        _ = rx.changed() => {}
+                    }
+                }
+                None => tokio::time::sleep_until(until).await,
+            }
+        }
+    }
+
+    /// One round of the polling path: open approvals, status, then the log.
+    /// True when the chat got its answer, its next approval or an error.
+    async fn poll_round(&self, chat: ChatId, sid: &str, w: &mut Watch, ignore: &[String]) -> bool {
+        match self.next_pending(sid, ignore).await {
+            Ok(Some(row)) => {
+                self.show_approval(chat, sid, &row).await;
+                return true;
+            }
+            Ok(None) => {}
+            Err(e) if e.is_retryable() => debug!("transient error while watching: {e}"),
+            Err(e) => {
+                self.report(chat, &Fail::Tole(e)).await;
+                return true;
+            }
+        }
+        // Status first, then the log: when the status says idle, the log
+        // read that follows already holds the final answer.
+        let busy = match self.tole.status(sid).await {
+            Ok(st) => st.busy,
+            Err(e) if e.is_retryable() => {
+                debug!("transient error while watching: {e}");
+                true
+            }
+            Err(e) => {
+                self.report(chat, &Fail::Tole(e)).await;
+                return true;
+            }
+        };
+        if let Some(c) = w.cursor {
+            // While busy one page per poll is enough; once idle, read on
+            // until the end so the last answer is not a mid-turn one.
+            match self.read_log(sid, c, busy).await {
+                Ok((at, text)) => {
+                    w.cursor = Some(at);
+                    if text.is_some() {
+                        w.last_text = text;
+                    }
+                }
+                Err(e) if e.is_retryable() => debug!("transient error while reading: {e}"),
+                Err(e) => {
+                    self.report(chat, &Fail::Tole(e)).await;
+                    return true;
+                }
+            }
+        }
+        if busy {
+            w.seen_busy = true;
+            return false;
+        }
+        if w.last_text.is_none() && !w.seen_busy && w.started.elapsed() < self.settings.resume_grace
+        {
+            return false;
+        }
+        // The turn may have parked on another approval in the instant
+        // between the two reads above. An announced one comes first.
+        if let Some(row) = self.notified_approval(sid, ignore) {
+            self.show_approval(chat, sid, &row).await;
+            return true;
+        }
+        if let Ok(Some(row)) = self.next_pending(sid, ignore).await {
+            self.show_approval(chat, sid, &row).await;
+            return true;
+        }
+        let msg = match (w.last_text.take(), w.cursor) {
+            (Some(t), _) => t,
+            (None, None) => "The action was allowed and is running or done, but I could \
+                             not read its answer. Use /status."
+                .to_owned(),
+            (None, Some(_)) => "The action finished without a text answer.".to_owned(),
+        };
+        self.say(chat, &msg).await;
+        true
+    }
+
+    /// Read the log after `from`: one page when `one_page`, else up to the
+    /// end. Returns the new cursor and the last assistant text seen.
+    async fn read_log(
+        &self,
+        sid: &str,
+        from: u64,
+        one_page: bool,
+    ) -> Result<(u64, Option<String>), ToleError> {
+        let mut at = from;
+        let mut text = None;
+        for _ in 0..MAX_IDLE_PAGES {
+            let page = self.tole.entries(sid, at, 100).await?;
+            for e in &page.entries {
+                if let Some(("assistant", t)) = e.message() {
+                    text = Some(t.to_owned());
+                }
+            }
+            let next = page.next_after.max(at);
+            let more = page.has_more && next > at;
+            at = next;
+            if one_page || !more {
+                break;
+            }
+        }
+        Ok((at, text))
+    }
+
+    /// The recorded turn end of `sid` when it belongs to the resumed leg.
+    /// Without a baseline there is no cursor to judge it by: the polls decide.
+    fn new_turn_end(
+        &self,
+        sid: &str,
+        baseline: Option<u64>,
+        ignore: &[String],
+    ) -> Option<TurnFinished> {
+        let t = self.notify.as_ref()?.latest_turn(sid)?;
+        is_new_turn_end(&t, baseline?, ignore).then_some(t)
+    }
+
+    /// Act on a `turn_finished` hint: one log read from the cursor for a
+    /// completed turn, the approval for a parked one, a fixed line otherwise.
+    async fn finish_from_hint(
+        &self,
+        chat: ChatId,
+        sid: &str,
+        cursor: Option<u64>,
+        ignore: &[String],
+        t: &TurnFinished,
+    ) -> Hint {
+        match t.status {
+            TurnStatus::Completed => {
+                let Some(from) = cursor else {
+                    return Hint::Fallback;
+                };
+                match self.read_log(sid, from, false).await {
+                    Ok((_, Some(text))) => self.say(chat, &text).await,
+                    Ok((_, None)) => {
+                        self.say(chat, "The action finished without a text answer.")
+                            .await
+                    }
+                    Err(e) => {
+                        debug!("could not read the answer after a turn event: {e}");
+                        return Hint::Fallback;
+                    }
+                }
+                Hint::Done
+            }
+            TurnStatus::ApprovalPending => {
+                if let Some(row) = self.notified_approval(sid, ignore) {
+                    self.show_approval(chat, sid, &row).await;
+                    return Hint::Done;
+                }
+                match self.next_pending(sid, ignore).await {
+                    Ok(Some(row)) => {
+                        self.show_approval(chat, sid, &row).await;
+                        Hint::Done
+                    }
+                    // Not open (yet, or any more): the polls decide.
+                    Ok(None) => Hint::Fallback,
+                    Err(e) => {
+                        debug!("could not read the approval after a turn event: {e}");
+                        Hint::Fallback
+                    }
+                }
+            }
+            status => match turn_end_text(status, t.code) {
+                Some(line) => {
+                    self.say(chat, line).await;
+                    Hint::Done
+                }
+                None => Hint::Fallback,
+            },
         }
     }
 
@@ -1206,6 +1397,57 @@ mod tests {
         assert!(decision_applied(Decision::Deny, "denied"));
         assert!(decision_applied(Decision::Deny, "expired"));
         assert!(!decision_applied(Decision::Deny, "approved"));
+    }
+
+    #[test]
+    fn turn_end_lines_are_fixed_and_cover_every_word() {
+        use TurnStatus as S;
+        for st in [
+            S::Cancelled,
+            S::Detached,
+            S::BudgetExhausted,
+            S::Failed,
+            S::Blocked,
+        ] {
+            assert!(turn_end_text(st, None).is_some(), "{st:?}");
+            assert!(turn_end_text(st, Some(TurnCode::Other)).is_some(), "{st:?}");
+        }
+        for st in [S::Completed, S::ApprovalPending, S::Other] {
+            assert_eq!(turn_end_text(st, None), None, "{st:?}");
+        }
+        assert!(turn_end_text(S::Failed, Some(TurnCode::Provider))
+            .unwrap()
+            .contains("provider"));
+    }
+
+    #[test]
+    fn only_a_turn_end_past_the_baseline_is_new() {
+        let t = |seq, status, approval: Option<&str>| TurnFinished {
+            session_id: "s".into(),
+            status,
+            code: None,
+            last_seq: seq,
+            settle: 1,
+            approval_id: approval.map(str::to_owned),
+        };
+        let ignore = vec!["apr-1".to_owned()];
+        assert!(is_new_turn_end(
+            &t(6, TurnStatus::Completed, None),
+            5,
+            &ignore
+        ));
+        assert!(!is_new_turn_end(
+            &t(4, TurnStatus::Completed, None),
+            5,
+            &ignore
+        ));
+        // The leg that stopped on the approval just decided is stale.
+        let parked = t(5, TurnStatus::ApprovalPending, Some("apr-1"));
+        assert!(!is_new_turn_end(&parked, 5, &ignore));
+        // A resumed leg that failed before appending settles at the baseline.
+        assert!(is_new_turn_end(&t(5, TurnStatus::Failed, None), 5, &ignore));
+        let other = t(5, TurnStatus::ApprovalPending, Some("apr-2"));
+        assert!(is_new_turn_end(&other, 5, &ignore));
     }
 
     #[test]

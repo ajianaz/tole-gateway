@@ -234,7 +234,8 @@ impl FakeTole {
         self.with(|s| s.dormant.clear());
     }
 
-    pub fn add_message(&self, id: &str, role: &str, text: &str) {
+    /// Append a message entry and return its `seq`.
+    pub fn add_message(&self, id: &str, role: &str, text: &str) -> u64 {
         self.with(|s| {
             let log = s.sessions.entry(id.to_string()).or_default();
             let seq = log.last().and_then(|e| e["seq"].as_u64()).unwrap_or(0) + 1;
@@ -243,7 +244,8 @@ impl FakeTole {
                 "type": "message", "timestamp": 1_787_807_227_226u64,
                 "payload": {"role": role, "text": text}
             }));
-        });
+            seq
+        })
     }
 
     pub fn script_prompt(&self, step: PromptStep) {

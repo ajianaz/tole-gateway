@@ -65,5 +65,6 @@ path = "/tole/events"
 destination = "gateway"
 # hmac_key_file = "/etc/tole-gateway/webhook.key"   # chmod 600
 max_body_bytes = 65536
-# While on, open approvals are still polled this often (seconds) as a fallback.
+# While on, a resumed turn is still polled this often (seconds) in case an event
+# was lost. List turn_finished in tole's events, or every answer waits for this.
 fallback_poll_secs = 15
