@@ -10,7 +10,9 @@
 //! is trusted before the signature check passes:
 //!
 //! 1. method and path (else `404`), a concurrency cap (`503`);
-//! 2. the body, read with a hard size cap and a deadline (`413` / `408`);
+//! 2. the body, read with a hard size cap and a deadline (`413` / `408`); a
+//!    request that says it is a `turn_finished` gets the tighter
+//!    [`MAX_TURN_BODY`] cap (a lie about the event fails the signature anyway);
 //! 3. the four `X-Tole-*` headers, the v2 HMAC over the raw body compared in
 //!    constant time, and the 300 second timestamp window: any failure is the
 //!    same bare `401`, so the answer never says which check failed;
@@ -24,6 +26,7 @@
 //! `docs/notify.md` for the reverse proxy or private network it is meant for.
 
 mod hub;
+mod turn;
 mod verify;
 
 use std::collections::HashMap;
@@ -42,6 +45,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info};
 
 pub use hub::{NotifyHub, Requested};
+pub use turn::{TurnCode, TurnFinished, TurnStatus, MAX_TURN_BODY};
 pub use verify::{sign, verify, Headers, Reject, WINDOW_SECS};
 
 use crate::secret::Secret;
@@ -176,18 +180,19 @@ async fn handle(State(s): State<Arc<Shared>>, req: Request) -> Response {
         return status(StatusCode::SERVICE_UNAVAILABLE);
     };
     let (parts, body) = req.into_parts();
+    // The header is not trusted yet; it can only make the cap tighter.
+    let limit = if header(&parts.headers, "x-tole-event") == "turn_finished" {
+        s.cfg.max_body_bytes.min(MAX_TURN_BODY)
+    } else {
+        s.cfg.max_body_bytes
+    };
     let declared = header(&parts.headers, "content-length")
         .parse::<usize>()
         .ok();
-    if declared.is_some_and(|n| n > s.cfg.max_body_bytes) {
+    if declared.is_some_and(|n| n > limit) {
         return status(StatusCode::PAYLOAD_TOO_LARGE);
     }
-    let bytes = match tokio::time::timeout(
-        READ_DEADLINE,
-        axum::body::to_bytes(body, s.cfg.max_body_bytes),
-    )
-    .await
-    {
+    let bytes = match tokio::time::timeout(READ_DEADLINE, axum::body::to_bytes(body, limit)).await {
         Ok(Ok(b)) => b,
         Ok(Err(_)) => return status(StatusCode::PAYLOAD_TOO_LARGE),
         Err(_) => return status(StatusCode::REQUEST_TIMEOUT),
@@ -219,7 +224,7 @@ async fn handle(State(s): State<Arc<Shared>>, req: Request) -> Response {
         debug!("authenticated webhook body disagrees with its headers or this destination");
         return status(StatusCode::BAD_REQUEST);
     }
-    let action = match parse_event(hdrs.event, &doc["data"]) {
+    let action = match parse_event(hdrs.event, hdrs.id, &doc["data"]) {
         Ok(a) => a,
         Err(()) => return status(StatusCode::BAD_REQUEST),
     };
@@ -234,6 +239,7 @@ async fn handle(State(s): State<Arc<Shared>>, req: Request) -> Response {
     match action {
         Action::Requested(r) => s.hub.record_requested(r),
         Action::Resolved(id) => s.hub.record_resolved(&id),
+        Action::Turn(t) => s.hub.record_turn(t),
         Action::Ignored => {}
     }
     debug!("webhook event accepted: {}", hdrs.event);
@@ -243,6 +249,7 @@ async fn handle(State(s): State<Arc<Shared>>, req: Request) -> Response {
 enum Action {
     Requested(Requested),
     Resolved(String),
+    Turn(TurnFinished),
     /// A well-formed event the gateway does not act on (`cron_run_finished`,
     /// `webhook_test`, future types): acknowledged so tole stops retrying.
     Ignored,
@@ -258,7 +265,7 @@ fn id_field(d: &Value, key: &str) -> Option<String> {
     text(d, key).filter(|s| verify::valid_token(s, 128))
 }
 
-fn parse_event(event: &str, data: &Value) -> Result<Action, ()> {
+fn parse_event(event: &str, id: &str, data: &Value) -> Result<Action, ()> {
     match event {
         "approval_requested" => Ok(Action::Requested(Requested {
             approval_id: id_field(data, "approval_id").ok_or(())?,
@@ -271,6 +278,7 @@ fn parse_event(event: &str, data: &Value) -> Result<Action, ()> {
             expires_at: data.get("expires_at").and_then(Value::as_u64).unwrap_or(0),
         })),
         "approval_resolved" => Ok(Action::Resolved(id_field(data, "approval_id").ok_or(())?)),
+        "turn_finished" => Ok(Action::Turn(turn::parse(id, data).ok_or(())?)),
         _ => Ok(Action::Ignored),
     }
 }
