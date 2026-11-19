@@ -141,6 +141,8 @@ struct Inner {
     decisions: Vec<(String, String)>,
     log: Vec<LoggedRequest>,
     next_session: u64,
+    /// Sessions whose status reports a running turn.
+    busy: Vec<String>,
 }
 
 type Shared = Arc<Mutex<Inner>>;
@@ -234,7 +236,18 @@ impl FakeTole {
         self.with(|s| s.dormant.clear());
     }
 
-    pub fn add_message(&self, id: &str, role: &str, text: &str) {
+    /// Make the session's status report a running turn (or not).
+    pub fn set_busy(&self, id: &str, busy: bool) {
+        self.with(|s| {
+            s.busy.retain(|b| b != id);
+            if busy {
+                s.busy.push(id.to_string());
+            }
+        });
+    }
+
+    /// Append a message entry and return its `seq`.
+    pub fn add_message(&self, id: &str, role: &str, text: &str) -> u64 {
         self.with(|s| {
             let log = s.sessions.entry(id.to_string()).or_default();
             let seq = log.last().and_then(|e| e["seq"].as_u64()).unwrap_or(0) + 1;
@@ -243,7 +256,8 @@ impl FakeTole {
                 "type": "message", "timestamp": 1_787_807_227_226u64,
                 "payload": {"role": role, "text": text}
             }));
-        });
+            seq
+        })
     }
 
     pub fn script_prompt(&self, step: PromptStep) {
@@ -514,7 +528,8 @@ fn route(s: &mut Inner, method: &str, seg: &[String], query: &str, body: &Value)
         ("GET", ["sessions", id] | ["sessions", id, "status"]) => match s.sessions.get(*id) {
             Some(log) => Routed::Now(
                 200,
-                json!({"id": id, "entries": log.len(), "busy": false, "usage_report": null}),
+                json!({"id": id, "entries": log.len(), "busy": s.busy.iter().any(|b| b == id),
+                       "usage_report": null}),
             ),
             None => not_found("unknown session"),
         },

@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde_json::{json, Value};
 use tempfile::TempDir;
 use tole_gateway::app::{Announce, App, AppSettings};
 use tole_gateway::auth::{Authorizer, PairingCode, PairingCodeSource, PairingError};
@@ -978,6 +979,64 @@ async fn post_requested(url: &str, key: &str, approval: &str, session: &str) -> 
         .as_u16()
 }
 
+/// Play tole: POST a signed `turn_finished` for `session` (key [`HOOK_KEY`]).
+/// `extra` adds or overrides `data` fields. Returns the HTTP status.
+async fn post_turn(url: &str, session: &str, last_seq: u64, settle: u64, extra: Value) -> u16 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let digest = ring::digest::digest(&ring::digest::SHA256, session.as_bytes());
+    let hash: String = digest.as_ref()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let id = format!("turn:{session}:{hash}:{last_seq}:{settle}");
+    let mut data =
+        serde_json::json!({"session_id": session, "status": "completed", "last_seq": last_seq});
+    for (k, v) in extra.as_object().unwrap() {
+        data[k] = v.clone();
+    }
+    let body = serde_json::json!({"v": 1, "id": id, "type": "turn_finished",
+                                  "destination": "gateway", "at": now, "data": data});
+    let body = serde_json::to_vec(&body).unwrap();
+    let ts = now.to_string();
+    reqwest::Client::new()
+        .post(format!("{url}/tole/events"))
+        .header("X-Tole-Timestamp", &ts)
+        .header("X-Tole-Delivery", &id)
+        .header("X-Tole-Event", "turn_finished")
+        .header(
+            "X-Tole-Signature",
+            sign(&Secret::new(HOOK_KEY), &ts, &id, "turn_finished", &body),
+        )
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// An allow pressed with the receiver on and both polls far longer than any
+/// test: only an event can end the wait.
+async fn allow_with_receiver() -> (Rig, String, tokio::task::JoinHandle<()>) {
+    let hub = Arc::new(NotifyHub::new(Duration::from_secs(3600)));
+    let r = rig_full(
+        &[OWNER],
+        |s| s.poll_interval = Duration::from_secs(120),
+        Some(hub.clone()),
+    )
+    .await;
+    let url = start_receiver(&hub).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write the notes")).await;
+    let allow = button(&r.tg, 0);
+    let task = press_in_task(&r, &allow);
+    wait_until("the decision", || !r.tole.decisions().is_empty()).await;
+    (r, url, task)
+}
+
 /// The requests the fake tole saw after the first decision POST.
 fn requests_after_decision(tole: &FakeTole) -> Vec<String> {
     let all = tole.requests();
@@ -1038,7 +1097,7 @@ async fn an_allow_followed_by_a_webhook_shows_the_next_approval_without_any_poll
 
 #[tokio::test]
 async fn a_forged_webhook_shows_nothing_and_polling_still_finishes_the_turn() {
-    let hub = Arc::new(NotifyHub::new(Duration::from_secs(3600)));
+    let hub = Arc::new(NotifyHub::new(Duration::from_millis(100)));
     let r = rig_full(&[OWNER], |_| {}, Some(hub.clone())).await;
     let url = start_receiver(&hub).await;
     script_approval(&r.tole, "apr-1");
@@ -1077,4 +1136,132 @@ async fn without_a_webhook_the_slow_fallback_poll_still_finds_the_next_approval(
     })
     .await;
     task.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_turn_finished_event_delivers_the_answer_with_one_log_read() {
+    let (r, url, task) = allow_with_receiver().await;
+    r.tole.add_message("srv-1", "tool", "wrote notes.md");
+    let seq = r.tole.add_message("srv-1", "assistant", "notes written");
+    assert_eq!(post_turn(&url, "srv-1", seq, 2, json!({})).await, 200);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the event ends the wait")
+        .unwrap();
+    assert_eq!(texts(&r.tg).last().unwrap(), "notes written");
+    let after = requests_after_decision(&r.tole);
+    assert!(
+        after
+            .iter()
+            .all(|q| q.starts_with("GET /sessions/srv-1/entries")),
+        "only the log is read, no status or approval poll: {after:?}"
+    );
+    assert!(!after.is_empty());
+    assert_no_secrets(&r);
+}
+
+#[tokio::test]
+async fn a_failed_turn_gets_a_fixed_line_not_text_from_the_log() {
+    let (r, url, task) = allow_with_receiver().await;
+    r.tole.add_message("srv-1", "assistant", "partial words");
+    let seq = r
+        .tole
+        .add_message("srv-1", "error", "provider said: details");
+    let failed = json!({"status": "failed", "code": "provider"});
+    assert_eq!(post_turn(&url, "srv-1", seq, 2, failed).await, 200);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        texts(&r.tg).last().unwrap(),
+        "The turn failed: the model provider returned an error."
+    );
+    assert_eq!(requests_after_decision(&r.tole), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn an_approval_pending_event_shows_the_next_approval_when_its_announcement_was_lost() {
+    let (r, url, task) = allow_with_receiver().await;
+    r.tole
+        .add_approval("apr-2", "srv-1", "write_file", "write more.md");
+    let seq = r.tole.add_message("srv-1", "tool", "wrote notes.md");
+    let parked = json!({"status": "approval_pending", "approval_id": "apr-2"});
+    assert_eq!(post_turn(&url, "srv-1", seq, 2, parked).await, 200);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count_text(&r.tg, "Approval needed"), 2);
+    assert!(texts(&r.tg).last().unwrap().contains("write more.md"));
+}
+
+#[tokio::test]
+async fn a_stale_event_from_the_parked_leg_is_ignored_and_the_fallback_poll_finishes() {
+    let hub = Arc::new(NotifyHub::new(Duration::from_millis(100)));
+    let r = rig_full(&[OWNER], |_| {}, Some(hub.clone())).await;
+    let url = start_receiver(&hub).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write the notes")).await;
+    let allow = button(&r.tg, 0);
+    let task = press_in_task(&r, &allow);
+    wait_until("the decision", || !r.tole.decisions().is_empty()).await;
+    // The leg that stopped on apr-1 reports itself late, at the baseline.
+    let parked = json!({"status": "approval_pending", "approval_id": "apr-1"});
+    assert_eq!(post_turn(&url, "srv-1", 0, 1, parked).await, 200);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!task.is_finished(), "a stale event ends nothing");
+    // No turn_finished for the resumed leg ever comes: the poll finds it.
+    r.tole.add_message("srv-1", "assistant", "notes written");
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(texts(&r.tg).last().unwrap(), "notes written");
+}
+
+#[tokio::test]
+async fn an_answer_a_busy_fallback_poll_already_read_is_still_delivered_on_the_event() {
+    // The fallback poll runs while the turn is still busy and its log read
+    // consumes the final assistant entry; the event then finds nothing newer.
+    let hub = Arc::new(NotifyHub::new(Duration::from_millis(50)));
+    let r = rig_full(&[OWNER], |_| {}, Some(hub.clone())).await;
+    let url = start_receiver(&hub).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write the notes")).await;
+    let allow = button(&r.tg, 0);
+    r.tole.set_busy("srv-1", true);
+    let task = press_in_task(&r, &allow);
+    wait_until("the decision", || !r.tole.decisions().is_empty()).await;
+    let seq = r.tole.add_message("srv-1", "assistant", "notes written");
+    let reads = || r.tole.requests_to("/sessions/srv-1/entries").len();
+    let before = reads();
+    wait_until("a busy poll that reads the answer", || reads() > before).await;
+    assert!(!task.is_finished(), "a busy poll does not end the wait");
+    assert_eq!(post_turn(&url, "srv-1", seq, 2, json!({})).await, 200);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the event ends the wait")
+        .unwrap();
+    assert_eq!(texts(&r.tg).last().unwrap(), "notes written");
+}
+
+#[tokio::test]
+async fn the_watch_timeout_is_not_overslept_by_a_long_fallback_poll() {
+    let hub = Arc::new(NotifyHub::new(Duration::from_secs(3600)));
+    let r = rig_full(
+        &[OWNER],
+        |s| s.watch_timeout = Duration::from_millis(300),
+        Some(hub),
+    )
+    .await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write the notes")).await;
+    let allow = button(&r.tg, 0);
+    let task = press_in_task(&r, &allow);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the timeout fires on time, not at the next poll")
+        .unwrap();
+    assert!(texts(&r.tg).last().unwrap().starts_with("No result yet"));
 }

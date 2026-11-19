@@ -12,16 +12,36 @@ decided through tole's single gate (`POST /approvals/{id}/decision`).
 | --- | --- |
 | `approval_requested` | After an Allow, an approval raised by the resumed turn is shown with its buttons at once, without polling `GET /approvals?session=`. The summary is untrusted text, shown as plain text. |
 | `approval_resolved` | Remembered, so a late or reordered `approval_requested` for an approval that already closed is dropped (events carry no order). |
-| `turn_finished` | Verified like every event, then its ids are checked (the `id` must be `turn:<session>:<hash16>:<last_seq>[:<settle>]` for the `session_id` and `last_seq` in `data`), and the latest end of each session is kept by `(last_seq, at, settle)` (`at` is the envelope time; the settle counter restarts with tole, so it only breaks a tie), so a late older event never replaces a newer one, also across a tole restart. It carries no text. A status or code word the gateway does not know yet is kept as "other" and acknowledged. Not yet used by the dispatcher. |
+| `turn_finished` | Verified like every event, then its ids are checked (the `id` must be `turn:<session>:<hash16>:<last_seq>[:<settle>]` for the `session_id` and `last_seq` in `data`), and the latest end of each session is kept by `(last_seq, at, settle)` (`at` is the envelope time; the settle counter restarts with tole, so it only breaks a tie), so a late older event never replaces a newer one, also across a tole restart. It carries no text. A status or code word the gateway does not know yet is kept as "other" and acknowledged. After an Allow, the end of the resumed turn ends the wait (see below). |
 | `cron_run_finished`, `webhook_test`, anything else | Acknowledged (`200`) and ignored: the gateway has no cron presentation yet. |
 
-An event carries a pointer, not the assistant's answer. tole's `turn_finished`
-is received and recorded, but the dispatcher does not act on it yet, so the
-gateway still reads `GET /sessions/{id}/status` and the log entries after an
-Allow to find the answer; what the receiver removes is the polling for
-approvals. While it is on, the open approvals are polled only every
-`fallback_poll_secs` (default 15) in case an event was lost. When the receiver
-is off, nothing changes from the polling behaviour.
+An event carries a pointer, not the assistant's answer, and it is only a
+**hint**: tole keeps these events in a volatile queue (retried for 15 minutes,
+lost on a serve restart). After an Allow the gateway waits like this:
+
+1. An `approval_requested` for the session shows the next approval.
+2. A `turn_finished` for the session whose `last_seq` is past the log position
+   read before the decision (the baseline) ends the wait. At the baseline
+   itself only the leg that stopped on the approval just decided is stale; any
+   other end there is a resumed leg that failed before writing anything.
+   - `completed`: one authenticated read of the log entries after the cursor
+     (the baseline, or as far as a fallback poll already read); the last
+     assistant message after the baseline is the answer, whether this read or
+     an earlier poll found it.
+   - `approval_pending`: the announced approval, or one read of
+     `GET /approvals?session=` when the announcement was lost.
+   - `cancelled`, `detached`, `budget_exhausted`, `failed`, `blocked`: a fixed
+     line written by the gateway from the status and code words (never text
+     from the event, which has none).
+   - an unknown word, or a read that fails: the polls below decide.
+3. With no usable event, the old polls (open approvals, `GET
+   /sessions/{id}/status`, then the log) run every `fallback_poll_secs`
+   (default 15) instead of every second. That is the bound on how long a lost
+   event can delay an answer.
+
+When the receiver is off, nothing changes from the one-second polling. List
+`turn_finished` in tole's `events` (below): without it every answer after an
+Allow waits for the fallback poll.
 
 ## Configure the gateway
 
@@ -47,7 +67,7 @@ that no other tole destination or hook shares. It is a `Secret`: it prints as
 [webhook_out.gateway]
 url = "http://127.0.0.1:7811/tole/events"
 hmac_key_env = "TOLE_GATEWAY_SECRET"     # the same value as the gateway's key
-events = ["approval_requested", "approval_resolved"]
+events = ["approval_requested", "approval_resolved", "turn_finished"]
 allow_loopback = true                     # only when the gateway is on the same host
 ```
 
