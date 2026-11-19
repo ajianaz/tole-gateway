@@ -207,6 +207,54 @@ async fn decide_allow_is_202_and_deny_is_200() {
 }
 
 #[tokio::test]
+async fn decide_again_with_the_same_verdict_is_200_and_not_resuming() {
+    let (fake, client) = fake_with_token().await;
+    fake.add_approval("a1", "srv-1", "write_file", "one");
+    assert!(client.decide("a1", Decision::Allow).await.unwrap().resuming);
+    let again = client.decide("a1", Decision::Allow).await.unwrap();
+    assert_eq!(again.status, "approved");
+    assert!(!again.resuming, "a repeat starts no second resume");
+    assert_eq!(fake.decisions().len(), 1);
+}
+
+#[tokio::test]
+async fn decide_409_with_a_status_is_an_answer_not_an_error() {
+    let (fake, client) = fake_with_token().await;
+    fake.add_approval("a1", "srv-1", "write_file", "one");
+    client.decide("a1", Decision::Allow).await.unwrap();
+    // The opposite verdict: tole answers 409 with the row's status.
+    let flip = client.decide("a1", Decision::Deny).await.unwrap();
+    assert_eq!(flip.id, "a1");
+    assert_eq!(flip.status, "approved");
+    assert!(!flip.resuming);
+    // An expired row answers 409 for either verdict.
+    fake.add_approval("a2", "srv-1", "write_file", "two");
+    fake.set_approval_status("a2", "expired");
+    let late = client.decide("a2", Decision::Allow).await.unwrap();
+    assert_eq!(late.status, "expired");
+}
+
+#[tokio::test]
+async fn decide_409_without_a_final_status_stays_a_conflict() {
+    let (fake, client) = fake_with_token().await;
+    fake.fail_with_body(
+        "POST",
+        "/approvals/a1/decision",
+        409,
+        r#"{"error":"writer lock held","status":"pending"}"#,
+    );
+    assert!(matches!(
+        client.decide("a1", Decision::Allow).await,
+        Err(ToleError::Conflict(_))
+    ));
+    fake.fail_with_body("POST", "/approvals/a1/decision", 409, "not json");
+    assert!(matches!(
+        client.decide("a1", Decision::Allow).await,
+        Err(ToleError::Conflict(_))
+    ));
+}
+
+#[tokio::test]
 async fn entries_pages_with_after_and_limit() {
     let (fake, client) = fake_with_token().await;
     fake.add_session("srv-1");

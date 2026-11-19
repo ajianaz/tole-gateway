@@ -132,8 +132,12 @@ struct Inner {
     /// A prompt to an unknown session answers the real server's 500.
     unknown_prompt_500: bool,
     failures: Vec<(String, String, u16, String)>,
-    /// A decision is applied and then answered with a 500 (an ambiguous failure).
+    /// The next decision is applied and then answered with a 500 (an ambiguous
+    /// failure: the verdict took effect, its audit write did not).
     apply_then_fail: bool,
+    /// Approvals whose verdict took effect but whose audit is still owed: the
+    /// same verdict again finishes it (and starts the resume), as tole does.
+    audit_pending: Vec<String>,
     decisions: Vec<(String, String)>,
     log: Vec<LoggedRequest>,
     next_session: u64,
@@ -274,7 +278,7 @@ impl FakeTole {
         row
     }
 
-    /// Make every decision apply and then answer `500` (the caller cannot tell).
+    /// Make the next decision apply and then answer `500` (the caller cannot tell).
     pub fn apply_decision_then_fail(&self) {
         self.with(|s| s.apply_then_fail = true);
     }
@@ -583,14 +587,40 @@ fn route(s: &mut Inner, method: &str, seg: &[String], query: &str, body: &Value)
             // A row that is no longer pending keeps its status: the real queue
             // answers with it instead of applying the decision.
             let current = row["status"].as_str().unwrap_or("pending").to_owned();
-            if current != "pending" {
-                return Routed::Now(200, json!({"id": id, "status": current}));
-            }
             let allow = decision == "allow";
+            if current != "pending" {
+                // Only the first decision counts (tole #938). The same verdict
+                // again answers 200 {resuming:false}, unless its audit is still
+                // owed, in which case it is finished now. The opposite verdict,
+                // or any decision on an expired row, is a 409 with the status.
+                let same = (allow && current == "approved") || (!allow && current == "denied");
+                if !same {
+                    return Routed::Now(
+                        409,
+                        json!({
+                            "error": format!("approval already {current}"),
+                            "id": id,
+                            "status": current,
+                        }),
+                    );
+                }
+                if let Some(at) = s.audit_pending.iter().position(|x| x == id) {
+                    s.audit_pending.remove(at);
+                    s.decisions.push((id.to_string(), decision.to_string()));
+                    return if allow {
+                        Routed::Now(202, json!({"id": id, "status": current, "resuming": true}))
+                    } else {
+                        Routed::Now(200, json!({"id": id, "status": current}))
+                    };
+                }
+                return Routed::Now(200, json!({"id": id, "status": current, "resuming": false}));
+            }
             let status = if allow { "approved" } else { "denied" };
             row["status"] = json!(status);
             s.decisions.push((id.to_string(), decision.to_string()));
             if s.apply_then_fail {
+                s.apply_then_fail = false;
+                s.audit_pending.push(id.to_string());
                 return Routed::Now(500, json!({"error": "decision applied, answer lost"}));
             }
             if allow {
