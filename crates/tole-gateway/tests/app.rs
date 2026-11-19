@@ -1219,3 +1219,49 @@ async fn a_stale_event_from_the_parked_leg_is_ignored_and_the_fallback_poll_fini
         .unwrap();
     assert_eq!(texts(&r.tg).last().unwrap(), "notes written");
 }
+
+#[tokio::test]
+async fn an_answer_a_busy_fallback_poll_already_read_is_still_delivered_on_the_event() {
+    // The fallback poll runs while the turn is still busy and its log read
+    // consumes the final assistant entry; the event then finds nothing newer.
+    let hub = Arc::new(NotifyHub::new(Duration::from_millis(50)));
+    let r = rig_full(&[OWNER], |_| {}, Some(hub.clone())).await;
+    let url = start_receiver(&hub).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write the notes")).await;
+    let allow = button(&r.tg, 0);
+    r.tole.set_busy("srv-1", true);
+    let task = press_in_task(&r, &allow);
+    wait_until("the decision", || !r.tole.decisions().is_empty()).await;
+    let seq = r.tole.add_message("srv-1", "assistant", "notes written");
+    let reads = || r.tole.requests_to("/sessions/srv-1/entries").len();
+    let before = reads();
+    wait_until("a busy poll that reads the answer", || reads() > before).await;
+    assert!(!task.is_finished(), "a busy poll does not end the wait");
+    assert_eq!(post_turn(&url, "srv-1", seq, 2, json!({})).await, 200);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the event ends the wait")
+        .unwrap();
+    assert_eq!(texts(&r.tg).last().unwrap(), "notes written");
+}
+
+#[tokio::test]
+async fn the_watch_timeout_is_not_overslept_by_a_long_fallback_poll() {
+    let hub = Arc::new(NotifyHub::new(Duration::from_secs(3600)));
+    let r = rig_full(
+        &[OWNER],
+        |s| s.watch_timeout = Duration::from_millis(300),
+        Some(hub),
+    )
+    .await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write the notes")).await;
+    let allow = button(&r.tg, 0);
+    let task = press_in_task(&r, &allow);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the timeout fires on time, not at the next poll")
+        .unwrap();
+    assert!(texts(&r.tg).last().unwrap().starts_with("No result yet"));
+}

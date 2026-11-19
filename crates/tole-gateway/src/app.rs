@@ -1065,8 +1065,7 @@ where
             if let Some(t) = self.new_turn_end(sid, baseline, ignore) {
                 if tried != Some(t.position()) {
                     tried = Some(t.position());
-                    if let Hint::Done = self.finish_from_hint(chat, sid, w.cursor, ignore, &t).await
-                    {
+                    if let Hint::Done = self.finish_from_hint(chat, sid, &mut w, ignore, &t).await {
                         return;
                     }
                 }
@@ -1087,8 +1086,10 @@ where
                     .await;
             }
             // A recorded event ends the wait early; the next poll is the
-            // fallback when none arrives.
-            let until = tokio::time::Instant::from_std(next_poll);
+            // fallback when none arrives. The overall limit is never overslept.
+            let until = tokio::time::Instant::from_std(
+                next_poll.min(w.started + self.settings.watch_timeout),
+            );
             match wake.as_mut() {
                 Some(rx) => {
                     tokio::select! {
@@ -1216,24 +1217,34 @@ where
 
     /// Act on a `turn_finished` hint: one log read from the cursor for a
     /// completed turn, the approval for a parked one, a fixed line otherwise.
+    ///
+    /// The read continues from the cursor the fallback polls advanced, so the
+    /// answer may already have been read by a poll that ran while the turn was
+    /// still busy: that text (`w.last_text`) is the answer when the read finds
+    /// no newer one.
     async fn finish_from_hint(
         &self,
         chat: ChatId,
         sid: &str,
-        cursor: Option<u64>,
+        w: &mut Watch,
         ignore: &[String],
         t: &TurnFinished,
     ) -> Hint {
         match t.status {
             TurnStatus::Completed => {
-                let Some(from) = cursor else {
+                let Some(from) = w.cursor else {
                     return Hint::Fallback;
                 };
                 match self.read_log(sid, from, false).await {
-                    Ok((_, Some(text))) => self.say(chat, &text).await,
-                    Ok((_, None)) => {
-                        self.say(chat, "The action finished without a text answer.")
-                            .await
+                    Ok((at, text)) => {
+                        w.cursor = Some(at);
+                        match text.or_else(|| w.last_text.take()) {
+                            Some(text) => self.say(chat, &text).await,
+                            None => {
+                                self.say(chat, "The action finished without a text answer.")
+                                    .await
+                            }
+                        }
                     }
                     Err(e) => {
                         debug!("could not read the answer after a turn event: {e}");

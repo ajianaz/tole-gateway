@@ -141,6 +141,8 @@ struct Inner {
     decisions: Vec<(String, String)>,
     log: Vec<LoggedRequest>,
     next_session: u64,
+    /// Sessions whose status reports a running turn.
+    busy: Vec<String>,
 }
 
 type Shared = Arc<Mutex<Inner>>;
@@ -232,6 +234,16 @@ impl FakeTole {
     /// Forget the logs that survived a `restart()` (the session files are gone).
     pub fn lose_dormant_logs(&self) {
         self.with(|s| s.dormant.clear());
+    }
+
+    /// Make the session's status report a running turn (or not).
+    pub fn set_busy(&self, id: &str, busy: bool) {
+        self.with(|s| {
+            s.busy.retain(|b| b != id);
+            if busy {
+                s.busy.push(id.to_string());
+            }
+        });
     }
 
     /// Append a message entry and return its `seq`.
@@ -516,7 +528,8 @@ fn route(s: &mut Inner, method: &str, seg: &[String], query: &str, body: &Value)
         ("GET", ["sessions", id] | ["sessions", id, "status"]) => match s.sessions.get(*id) {
             Some(log) => Routed::Now(
                 200,
-                json!({"id": id, "entries": log.len(), "busy": false, "usage_report": null}),
+                json!({"id": id, "entries": log.len(), "busy": s.busy.iter().any(|b| b == id),
+                       "usage_report": null}),
             ),
             None => not_found("unknown session"),
         },
