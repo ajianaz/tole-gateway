@@ -100,17 +100,23 @@ pub struct TurnFinished {
     pub code: Option<TurnCode>,
     /// The `seq` of the newest log entry when the turn settled.
     pub last_seq: u64,
+    /// When tole built the event (envelope `at`, unix seconds; retries keep
+    /// it). Orders two settles at the same `last_seq`, also across a restart.
+    pub at: u64,
     /// tole's per-process settle counter, from the event id (0 when absent).
-    /// It orders two settles at the same `last_seq`; it restarts with tole.
+    /// It restarts with tole, so it only breaks a tie of equal `at`.
     pub settle: u64,
     /// The approval an `approval_pending` turn stopped on.
     pub approval_id: Option<String>,
 }
 
 impl TurnFinished {
-    /// The order of two events of one session: by `last_seq`, then `settle`.
-    pub fn position(&self) -> (u64, u64) {
-        (self.last_seq, self.settle)
+    /// The order of two events of one session: by `last_seq` (durable, the
+    /// only order tole keeps across a restart), then `at`, then `settle`.
+    /// `settle` alone is not trusted: after a tole restart it starts at 1
+    /// again, while a later settle at the same `last_seq` has a later `at`.
+    pub fn position(&self) -> (u64, u64, u64) {
+        (self.last_seq, self.at, self.settle)
     }
 }
 
@@ -160,9 +166,9 @@ fn parse_id(id: &str, session_id: &str) -> Option<(u64, u64)> {
 }
 
 /// Parse the `data` of a `turn_finished` whose envelope `id` already matched
-/// the signed headers. `None` when a field is missing or not well formed, or
+/// the signed headers; `at` is the envelope's `at`. `None` when a field is missing or not well formed, or
 /// the id does not belong to the session and position the data names.
-pub fn parse(id: &str, data: &Value) -> Option<TurnFinished> {
+pub fn parse(id: &str, at: u64, data: &Value) -> Option<TurnFinished> {
     let session_id = data.get("session_id")?.as_str()?;
     if !valid_session_id(session_id) {
         return None;
@@ -186,6 +192,7 @@ pub fn parse(id: &str, data: &Value) -> Option<TurnFinished> {
         status,
         code,
         last_seq,
+        at,
         settle,
         approval_id,
     })
@@ -207,18 +214,18 @@ mod tests {
     #[test]
     fn the_pinned_body_parses() {
         let data = json!({"last_seq": 14, "session_id": "s-1f2e3d", "status": "completed"});
-        let t = parse(ID, &data).unwrap();
+        let t = parse(ID, 7, &data).unwrap();
         assert_eq!(t.session_id, "s-1f2e3d");
         assert_eq!(t.status, TurnStatus::Completed);
-        assert_eq!(t.position(), (14, 1));
+        assert_eq!(t.position(), (14, 7, 1));
         assert_eq!((t.code, t.approval_id), (None, None));
     }
 
     #[test]
     fn an_id_without_a_settle_counter_is_settle_zero() {
         let data = json!({"last_seq": 14, "session_id": "s-1f2e3d", "status": "cancelled"});
-        let t = parse("turn:s-1f2e3d:357319c7c674b505:14", &data).unwrap();
-        assert_eq!(t.position(), (14, 0));
+        let t = parse("turn:s-1f2e3d:357319c7c674b505:14", 7, &data).unwrap();
+        assert_eq!(t.position(), (14, 7, 0));
     }
 
     #[test]
@@ -226,8 +233,8 @@ mod tests {
         let ok = json!({"last_seq": 14, "session_id": "s-1f2e3d", "status": "completed"});
         let other = json!({"last_seq": 14, "session_id": "s-other", "status": "completed"});
         let moved = json!({"last_seq": 15, "session_id": "s-1f2e3d", "status": "completed"});
-        assert!(parse(ID, &other).is_none());
-        assert!(parse(ID, &moved).is_none());
+        assert!(parse(ID, 7, &other).is_none());
+        assert!(parse(ID, 7, &moved).is_none());
         for id in [
             "turn:s-1f2e3d:0000000000000000:14:1",
             "turn:s-1f2e3e:357319c7c674b505:14:1",
@@ -236,7 +243,7 @@ mod tests {
             "turn:s-1f2e3d:357319c7c674b505:x:1",
             "turn:s-1f2e3d:357319c7c674b505:14:-1",
         ] {
-            assert!(parse(id, &ok).is_none(), "{id}");
+            assert!(parse(id, 7, &ok).is_none(), "{id}");
         }
     }
 
@@ -247,7 +254,7 @@ mod tests {
             for (k, v) in extra.as_object().unwrap() {
                 d[k] = v.clone();
             }
-            parse(ID, &d)
+            parse(ID, 7, &d)
         };
         assert_eq!(
             base(json!({"code": "stop_gate"})).unwrap().code,

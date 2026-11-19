@@ -1057,7 +1057,7 @@ where
         let mut next_poll = w.started + poll_every;
         // The position of the last hint tried, so a failed one is not retried
         // in a loop; a newer event still is.
-        let mut tried: Option<(u64, u64)> = None;
+        let mut tried: Option<(u64, u64, u64)> = None;
         loop {
             if let Some(row) = self.notified_approval(sid, ignore) {
                 return self.show_approval(chat, sid, &row).await;
@@ -1427,6 +1427,7 @@ mod tests {
             status,
             code: None,
             last_seq: seq,
+            at: 0,
             settle: 1,
             approval_id: approval.map(str::to_owned),
         };

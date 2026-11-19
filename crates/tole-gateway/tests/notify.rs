@@ -322,13 +322,18 @@ const TURN_SIG: &str = "v2=40b6e20fcf55ad9521b43149ff2314ff1c852b65d8e1463d3b1d2
 
 /// A `turn_finished` body for `session` "s-1f2e3d" at `(last_seq, settle)`.
 fn turn(last_seq: u64, settle: u64, data: Value) -> (String, Vec<u8>) {
+    turn_at(last_seq, settle, NOW, data)
+}
+
+/// [`turn`] with the envelope `at` set.
+fn turn_at(last_seq: u64, settle: u64, at: u64, data: Value) -> (String, Vec<u8>) {
     let id = format!("turn:s-1f2e3d:357319c7c674b505:{last_seq}:{settle}");
     let mut d = json!({"session_id": "s-1f2e3d", "status": "completed", "last_seq": last_seq});
     for (k, v) in data.as_object().unwrap() {
         d[k] = v.clone();
     }
     let body = json!({"v": 1, "id": id, "type": "turn_finished", "destination": "gateway",
-                      "at": NOW, "data": d});
+                      "at": at, "data": d});
     (id, serde_json::to_vec(&body).unwrap())
 }
 
@@ -377,6 +382,28 @@ async fn a_late_older_turn_end_does_not_replace_a_newer_one() {
     assert_eq!(
         (t.status, t.code),
         (TurnStatus::Failed, Some(TurnCode::Provider))
+    );
+}
+
+#[tokio::test]
+async fn after_a_tole_restart_a_lower_settle_at_the_same_last_seq_is_still_newer() {
+    let r = rig().await;
+    let post = |settle, at, data: Value| {
+        let (id, body) = turn_at(15, settle, at, data);
+        Req::signed(&id, "turn_finished", &body, NOW)
+    };
+    // The old process left settle 5; the restarted one counts from 1 again.
+    assert_eq!(send(&r, &post(5, NOW - 60, json!({}))).await.0, 200);
+    let failed = json!({"status": "failed", "code": "storage"});
+    assert_eq!(send(&r, &post(1, NOW, failed)).await.0, 200);
+    let t = r.hub.latest_turn("s-1f2e3d").unwrap();
+    assert_eq!((t.status, t.settle), (TurnStatus::Failed, 1));
+    // A retry of the old process's event, arriving late, stays older.
+    let late = json!({"status": "cancelled"});
+    assert_eq!(send(&r, &post(4, NOW - 90, late)).await.0, 200);
+    assert_eq!(
+        r.hub.latest_turn("s-1f2e3d").unwrap().status,
+        TurnStatus::Failed
     );
 }
 

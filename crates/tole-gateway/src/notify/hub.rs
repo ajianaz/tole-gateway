@@ -161,7 +161,7 @@ impl NotifyHub {
     }
 
     /// Record a settled turn. Only the latest end of a session is kept, by
-    /// `(last_seq, settle)`: events carry no order on the wire, so an older one
+    /// `(last_seq, at, settle)` ([`TurnFinished::position`]): events carry no order on the wire, so an older one
     /// that arrives late is dropped here (tole `docs/turn-finished-event.md`
     /// section 7).
     pub fn record_turn(&self, t: TurnFinished) {
