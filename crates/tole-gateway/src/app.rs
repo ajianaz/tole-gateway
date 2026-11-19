@@ -909,6 +909,14 @@ where
         };
         match state {
             Some((true, _)) => {
+                // The verdict took effect but the answer was lost or tole could
+                // not write its audit record, in which case it did not start the
+                // resume. The same verdict again finishes that (tole acts on a
+                // decision once, so it cannot run the action twice); whatever it
+                // answers, watching the session tells the rest.
+                if let Err(e) = self.tole.decide(&p.approval_id, Decision::Allow).await {
+                    debug!("retrying the allow failed: {e}");
+                }
                 let note = format!("{}: allowed.", cap(&p.tool, 60));
                 let _ = self.chat.finish_approval(p.message, &note).await;
                 self.watch_resume(chat, &p.session_id, baseline, ignore)

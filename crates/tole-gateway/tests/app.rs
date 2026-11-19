@@ -742,6 +742,74 @@ async fn a_failed_denial_is_not_reported_as_denied_and_is_retried_by_the_sweep()
     assert_eq!(r.tole.decisions().len(), 1, "retried once, then dropped");
 }
 
+/// tole acts only on the first decision (tole #938): an allow whose answer was
+/// lost is retried, which finishes the audit and the resume that the failed
+/// first call left undone.
+#[tokio::test]
+async fn an_allow_answered_500_is_retried_so_tole_finishes_the_resume() {
+    let r = rig(&[OWNER]).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write")).await;
+    let allow = button(&r.tg, 0);
+    r.tole.apply_decision_then_fail();
+    let task = press_in_task(&r, &allow);
+    wait_until("the retried decision", || r.tole.decisions().len() == 2).await;
+    r.tole.add_message("srv-1", "assistant", "notes written");
+    task.await.unwrap();
+    assert_eq!(
+        r.tole.decisions(),
+        vec![
+            ("apr-1".to_owned(), "allow".to_owned()),
+            ("apr-1".to_owned(), "allow".to_owned()),
+        ],
+        "the same verdict, sent again"
+    );
+    assert_eq!(
+        r.tole.requests_to("/approvals/apr-1/decision").len(),
+        2,
+        "once more, not in a loop"
+    );
+    assert_eq!(texts(&r.tg).last().unwrap(), "notes written");
+}
+
+/// A decision that arrives after the request was decided the other way is a
+/// 409 with the row's status: say what happened, never "not recorded", and do
+/// not queue a denial for a request that is already approved.
+#[tokio::test]
+async fn a_decision_for_a_request_already_decided_the_other_way_is_reported() {
+    let r = rig(&[OWNER]).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write")).await;
+    let deny = button(&r.tg, 1);
+    r.tole.set_approval_status("apr-1", "approved");
+    r.app.handle(press(OWNER, OWNER, &deny)).await;
+    let last = texts(&r.tg).last().unwrap().clone();
+    assert!(last.contains("already approved"), "{last}");
+    assert!(!last.contains("could not record"), "{last}");
+    assert!(!last.contains("will be denied"), "{last}");
+    r.app.sweep().await;
+    r.app.sweep().await;
+    assert_eq!(
+        r.tole.requests_to("/approvals/apr-1/decision").len(),
+        1,
+        "no later denial attempt"
+    );
+}
+
+/// An expired request answers 409 for any verdict.
+#[tokio::test]
+async fn an_allow_after_the_request_expired_says_so() {
+    let r = rig(&[OWNER]).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write")).await;
+    let allow = button(&r.tg, 0);
+    r.tole.set_approval_status("apr-1", "expired");
+    r.app.handle(press(OWNER, OWNER, &allow)).await;
+    let last = texts(&r.tg).last().unwrap().clone();
+    assert!(last.contains("already expired"), "{last}");
+    assert!(r.tole.decisions().is_empty(), "nothing was applied");
+}
+
 #[tokio::test]
 async fn an_allow_that_was_applied_despite_the_error_is_watched() {
     let r = rig(&[OWNER]).await;

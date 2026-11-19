@@ -15,7 +15,13 @@
 //! - `POST /sessions/{id}/cancel`, `GET /sessions/{id}/status`,
 //!   `GET /approvals?session=<id>`, `POST /approvals/{id}/decision`
 //!   `{"decision":"allow"|"deny"}` (`202 {resuming:true}` for allow, `200` for
-//!   deny, `404` unknown id), `GET /sessions/{id}/entries?after=&limit=`.
+//!   deny, `404` unknown id). Only the first decision takes effect (tole
+//!   #938): the same verdict again is `200 {resuming:false}`; the opposite
+//!   verdict, or any decision on an expired entry, is `409 {error, id,
+//!   status}`, which [`HttpToleClient`] returns as a [`DecisionAck`] holding
+//!   the row's current status (the decision changed nothing). A `500` after
+//!   the verdict took effect (its audit write failed) is finished by retrying
+//!   the same verdict. `GET /sessions/{id}/entries?after=&limit=`.
 //! - After an allow, the resumed turn has NO HTTP answer: the caller polls
 //!   status and entries (that logic lives in the app, not here).
 //! - Errors map to [`crate::error::ToleError`]. Never put the token in an error.
@@ -244,15 +250,15 @@ impl HttpToleClient {
         url
     }
 
-    /// Send one request. Returns the 2xx answer or the mapped error.
-    async fn send(
+    /// Send one request. Returns the status and the capped body, whatever the
+    /// status is; only a transport failure is an error.
+    async fn send_raw(
         &self,
         method: Method,
         url: Url,
         body: Option<Value>,
         timeout: Duration,
-        busy_on_409: bool,
-    ) -> Result<Reply, ToleError> {
+    ) -> Result<(StatusCode, Vec<u8>), ToleError> {
         let mut req = self.http.request(method, url).timeout(timeout);
         req = match &self.auth {
             ToleAuth::Bearer(token) => req.bearer_auth(token.expose()),
@@ -264,6 +270,19 @@ impl HttpToleClient {
         let resp = req.send().await.map_err(map_reqwest_error)?;
         let status = resp.status();
         let bytes = read_capped(resp).await?;
+        Ok((status, bytes))
+    }
+
+    /// Send one request. Returns the 2xx answer or the mapped error.
+    async fn send(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<Value>,
+        timeout: Duration,
+        busy_on_409: bool,
+    ) -> Result<Reply, ToleError> {
+        let (status, bytes) = self.send_raw(method, url, body, timeout).await?;
         if status.is_success() {
             return Ok(Reply { body: bytes });
         }
@@ -326,6 +345,14 @@ fn error_text(body: &[u8]) -> String {
         Err(_) => String::from_utf8_lossy(body).into_owned(),
     };
     cap(&text)
+}
+
+/// The `status` of a `409` answer to a decision, when it is one of the final
+/// states of an approval. Anything else (another kind of conflict) is `None`.
+fn already_decided_status(body: &[u8]) -> Option<String> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    let status = v.get("status")?.as_str()?;
+    matches!(status, "approved" | "denied" | "expired").then(|| status.to_owned())
 }
 
 fn map_status(status: StatusCode, body: &[u8], busy_on_409: bool) -> ToleError {
@@ -496,13 +523,30 @@ impl ToleApi for HttpToleClient {
     ) -> Result<DecisionAck, ToleError> {
         check_id(approval_id)?;
         let url = self.url(&["approvals", approval_id, "decision"], &[]);
-        self.json(
-            Method::POST,
-            url,
-            Some(json!({ "decision": decision.as_str() })),
-            self.request_timeout,
-        )
-        .await
+        let (status, bytes) = self
+            .send_raw(
+                Method::POST,
+                url,
+                Some(json!({ "decision": decision.as_str() })),
+                self.request_timeout,
+            )
+            .await?;
+        if status.is_success() {
+            return decode(&bytes);
+        }
+        // `409 {"error", "id", "status"}`: the approval was already decided the
+        // other way, or had expired, so this decision changed nothing. That is
+        // an answer about the row, not a failure: report its status.
+        if status == StatusCode::CONFLICT {
+            if let Some(current) = already_decided_status(&bytes) {
+                return Ok(DecisionAck {
+                    id: approval_id.to_owned(),
+                    status: current,
+                    resuming: false,
+                });
+            }
+        }
+        Err(map_status(status, &bytes, false))
     }
 
     async fn entries(
