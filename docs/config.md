@@ -25,6 +25,13 @@ means pairing mode.
 
 `[sessions]`: `rollover_hours` (default 4, at least 1).
 
+`[notify]` (off by default, see [notify.md](notify.md)): `enabled` (default
+false), `listen` (default `127.0.0.1:7811`; loopback unless `allow_non_loopback`
+is true), `path` (default `/tole/events`), `destination` (default `gateway`,
+`[a-z0-9_-]{1,32}`), `hmac_key_file`, `max_body_bytes` (default 65536, 1024 to
+1048576), `fallback_poll_secs` (default 15, 1 to 3600). The rules are checked
+only when `enabled` is true.
+
 Validation reports all problems in a single error, one per line.
 
 ## Environment variables and precedence
@@ -35,6 +42,7 @@ Validation reports all problems in a single error, one per line.
 | `TOLE_SERVE_BASIC_USER` | `tole.basic_user` |
 | `TOLE_SERVE_BASIC_PASSWORD` | `tole.basic_password` |
 | `TOLE_GATEWAY_BOT_TOKEN` | `telegram.bot_token_file`, `telegram.bot_token` |
+| `TOLE_GATEWAY_WEBHOOK_KEY` | `notify.hmac_key_file` (the webhook signing key; never an inline value) |
 | `XDG_STATE_HOME`, `HOME` | default for `state_dir` |
 
 For each secret the order is: environment, then the `*_file` key, then the

@@ -52,3 +52,18 @@ pairing_ttl_secs = 600
 [sessions]
 # Start a new session after this many hours without an owner message (>= 1).
 rollover_hours = 4
+
+[notify]
+# Receiver for tole's signed outbound webhooks. OFF by default; see docs/notify.md.
+# It is plain HTTP on loopback: put your own reverse proxy in front of it, or use a
+# private network. The signing key is TOLE_GATEWAY_WEBHOOK_KEY or hmac_key_file only.
+enabled = false
+listen = "127.0.0.1:7811"
+# allow_non_loopback = false
+path = "/tole/events"
+# The name of tole's [webhook_out.<name>] destination.
+destination = "gateway"
+# hmac_key_file = "/etc/tole-gateway/webhook.key"   # chmod 600
+max_body_bytes = 65536
+# While on, open approvals are still polled this often (seconds) as a fallback.
+fallback_poll_secs = 15

@@ -26,6 +26,9 @@ Telegram  <--long polling-->  tole-gateway  <--HTTP, loopback-->  tole serve
   shows the tool and a one-line description with **Allow** and **Deny**
   buttons. The decision goes through tole's single approval gate. An approval
   you do not answer is denied.
+- Optionally (`[notify]`, off by default) tole's signed outbound webhooks tell
+  the gateway about approvals raised by a resumed turn, so it need not poll for
+  them; polling remains the fallback.
 - A new session starts after 4 hours without a message from you, or on `/new`.
 - Only chats on the allowlist, or one that has just entered the one-time
   pairing code, reach tole. Everyone else gets no reply at all.
@@ -104,6 +107,7 @@ cargo build --workspace --release
 ## Documentation
 
 - [docs/config.md](docs/config.md): every configuration key and environment variable.
+- [docs/notify.md](docs/notify.md): the optional receiver for tole's signed webhooks.
 - [docs/design.md](docs/design.md): decisions, module plan and roadmap.
 - [docs/e2e.md](docs/e2e.md): end-to-end tests against a real `tole serve`.
 - [CONTRIBUTING.md](CONTRIBUTING.md): workflow, branches, PRs, review gate.

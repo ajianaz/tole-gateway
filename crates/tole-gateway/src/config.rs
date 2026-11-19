@@ -34,6 +34,21 @@ fn default_pairing_ttl_secs() -> u64 {
 fn default_rollover_hours() -> u64 {
     4
 }
+fn default_notify_listen() -> String {
+    "127.0.0.1:7811".to_string()
+}
+fn default_notify_path() -> String {
+    "/tole/events".to_string()
+}
+fn default_notify_destination() -> String {
+    "gateway".to_string()
+}
+fn default_notify_max_body_bytes() -> usize {
+    64 * 1024
+}
+fn default_notify_fallback_poll_secs() -> u64 {
+    15
+}
 
 /// Environment lookup, injectable for tests.
 pub type EnvFn<'a> = &'a dyn Fn(&str) -> Option<String>;
@@ -45,6 +60,8 @@ pub const ENV_TOLE_TOKEN: &str = "TOLE_SERVE_TOKEN"; // cora-ignore: sec-hardcod
 pub const ENV_TOLE_BASIC_USER: &str = "TOLE_SERVE_BASIC_USER";
 /// Name of the env var holding the Basic auth password (a name, not a secret).
 pub const ENV_TOLE_BASIC_PASSWORD: &str = "TOLE_SERVE_BASIC_PASSWORD"; // cora-ignore: sec-hardcoded-secret
+/// Name of the env var holding the webhook signing key (a name, not a secret).
+pub const ENV_WEBHOOK_KEY: &str = "TOLE_GATEWAY_WEBHOOK_KEY"; // cora-ignore: sec-hardcoded-secret
 /// Name of the env var holding the Telegram bot token (a name, not a secret).
 pub const ENV_BOT_TOKEN: &str = "TOLE_GATEWAY_BOT_TOKEN"; // cora-ignore: sec-hardcoded-secret
 
@@ -126,6 +143,9 @@ pub struct Config {
     /// Session behaviour.
     #[serde(default)]
     pub sessions: SessionSection,
+    /// The optional receiver for tole's signed outbound webhooks.
+    #[serde(default)]
+    pub notify: NotifySection,
     /// Where the gateway keeps its own state (the chat-to-session index).
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
@@ -262,7 +282,87 @@ impl Default for SessionSection {
     }
 }
 
+/// The `[notify]` table: the receiver for tole's `[webhook_out.<name>]`
+/// deliveries. Off by default; plain HTTP on loopback by design (put it behind
+/// your own reverse proxy or private network, see `docs/notify.md`). The
+/// signing key is never a config value: environment or key file only.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotifySection {
+    /// Start the receiver. Default false: nothing listens.
+    #[serde(default)]
+    pub enabled: bool,
+    /// `host:port` to bind. Must be a loopback address unless
+    /// `allow_non_loopback` is set.
+    #[serde(default = "default_notify_listen")]
+    pub listen: String,
+    /// Allow a non-loopback `listen` address (behind your own proxy or a
+    /// private network only). Default false.
+    #[serde(default)]
+    pub allow_non_loopback: bool,
+    /// The URL path tole posts to.
+    #[serde(default = "default_notify_path")]
+    pub path: String,
+    /// The name of the tole `[webhook_out.<name>]` destination; a body that
+    /// names another destination is refused.
+    #[serde(default = "default_notify_destination")]
+    pub destination: String,
+    /// Read the HMAC signing key from this file (chmod 600).
+    #[serde(default)]
+    pub hmac_key_file: Option<PathBuf>,
+    /// Largest request body accepted, in bytes (1 KiB to 1 MiB).
+    #[serde(default = "default_notify_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// While the receiver is on, how often the open approvals are still
+    /// polled as a fallback, in seconds (1 to 3600).
+    #[serde(default = "default_notify_fallback_poll_secs")]
+    pub fallback_poll_secs: u64,
+}
+
+impl Default for NotifySection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: default_notify_listen(),
+            allow_non_loopback: false,
+            path: default_notify_path(),
+            destination: default_notify_destination(),
+            hmac_key_file: None,
+            max_body_bytes: default_notify_max_body_bytes(),
+            fallback_poll_secs: default_notify_fallback_poll_secs(),
+        }
+    }
+}
+
+/// Shortest accepted signing key, in bytes (tole refuses shorter ones too).
+pub const MIN_WEBHOOK_KEY_BYTES: usize = 16;
+
 impl Config {
+    /// Resolve the webhook signing key: environment, then
+    /// `notify.hmac_key_file`. Never an inline config value.
+    pub fn webhook_key(&self, env: EnvFn<'_>) -> Result<Secret, ConfigError> {
+        let key = if let Some(v) = env_value(env, ENV_WEBHOOK_KEY) {
+            nonblank(Secret::new(v), &format!("env {ENV_WEBHOOK_KEY}"))?
+        } else if let Some(p) = &self.notify.hmac_key_file {
+            read_secret_file(p, "notify.hmac_key_file")?
+        } else {
+            return Err(ConfigError::Missing(format!(
+                "no webhook signing key: set {ENV_WEBHOOK_KEY} or notify.hmac_key_file"
+            )));
+        };
+        if key.expose().len() < MIN_WEBHOOK_KEY_BYTES {
+            return Err(ConfigError::Missing(format!(
+                "the webhook signing key must be at least {MIN_WEBHOOK_KEY_BYTES} bytes"
+            )));
+        }
+        Ok(key)
+    }
+
+    /// The address to bind, when the receiver is enabled and valid.
+    pub fn notify_addr(&self) -> Option<std::net::SocketAddr> {
+        self.notify.listen.parse().ok()
+    }
+
     /// Load the configuration file at `path`, reading the real environment
     /// where needed.
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
@@ -397,10 +497,39 @@ impl Config {
         if self.sessions.rollover_hours < 1 {
             p.push("sessions.rollover_hours must be at least 1".into());
         }
+        self.validate_notify(&mut p);
         if p.is_empty() {
             Ok(())
         } else {
             Err(ConfigError::Invalid(p))
+        }
+    }
+
+    fn validate_notify(&self, p: &mut Vec<String>) {
+        let n = &self.notify;
+        if !n.enabled {
+            return;
+        }
+        match n.listen.parse::<std::net::SocketAddr>() {
+            Err(_) => p.push("notify.listen must be an ip:port address".into()),
+            Ok(a) if !a.ip().is_loopback() && !n.allow_non_loopback => p.push(
+                "notify.listen is not a loopback address; bind loopback and put your reverse \
+                 proxy in front, or set notify.allow_non_loopback = true on a private network"
+                    .into(),
+            ),
+            Ok(_) => {}
+        }
+        if !n.path.starts_with('/') || n.path.len() > 200 || n.path.contains(['?', '#', ' ']) {
+            p.push("notify.path must start with / and hold no query or space".into());
+        }
+        if !valid_profile_name(&n.destination) || n.destination.len() > 32 {
+            p.push("notify.destination must match [a-z0-9_-]{1,32}".into());
+        }
+        if !(1024..=1024 * 1024).contains(&n.max_body_bytes) {
+            p.push("notify.max_body_bytes must be between 1024 and 1048576".into());
+        }
+        if !(1..=3600).contains(&n.fallback_poll_secs) {
+            p.push("notify.fallback_poll_secs must be between 1 and 3600".into());
         }
     }
 

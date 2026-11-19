@@ -72,6 +72,9 @@ kills the child on drop, and prints the child's stderr when a test fails.
 
 ## Limits
 
+- The webhook receiver ([notify.md](notify.md)) is tested against a fake tole
+  that plays the signer; it has not run against a real `tole serve` with a
+  `[webhook_out]` destination yet.
 - No real Telegram: the Bot API is a fake, so message formatting limits, rate
   limits, long polling behavior and button rendering on a phone are not
   exercised.

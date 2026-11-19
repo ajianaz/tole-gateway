@@ -8,6 +8,10 @@
 //! - After an allow the resumed turn has no HTTP answer, so the app polls
 //!   `GET /approvals?session=` and `GET /sessions/{id}/status` until the
 //!   session is idle and then reads the new log entries for the final answer.
+//!   With the webhook receiver on ([`crate::notify`]) an approval the resumed
+//!   turn raises arrives as a signed event and is shown without polling for
+//!   it; the open approvals are then polled only as a slow fallback, and the
+//!   status and log reads stay (tole sends no "turn finished" event).
 //! - One turn at a time per chat. A message that arrives while a turn runs or
 //!   an approval is pending is answered with a short notice, never queued.
 //! - Chats that are not authorized get no reply at all, except that an unknown
@@ -26,6 +30,7 @@ use crate::auth::{Authorizer, PairOutcome, PairingCode, PairingCodeSource};
 use crate::channel::{ChatId, ChatPort, ChatSource, Inbound, MessageRef, UserId};
 use crate::config::Config;
 use crate::error::{ChatError, ToleError};
+use crate::notify::NotifyHub;
 use crate::sessions::{can_force_new, plan, Clock, NewReason, Plan, SessionIndex};
 use crate::tole_client::ToleApi;
 use crate::types::{ApprovalRow, ApprovalStatus, Decision, PromptOutcome};
@@ -154,6 +159,8 @@ pub struct App<T, C, K: Clock, S: PairingCodeSource> {
     settings: AppSettings,
     inner: Mutex<Inner<K, S>>,
     announce: Announce,
+    /// Present when the webhook receiver is on.
+    notify: Option<Arc<NotifyHub>>,
 }
 
 enum Command {
@@ -278,7 +285,16 @@ where
                 retry_deny: Vec::new(),
             }),
             announce,
+            notify: None,
         }
+    }
+
+    /// Use the events a webhook receiver records instead of polling for the
+    /// approvals a resumed turn raises. Polling stays as the fallback.
+    #[must_use]
+    pub fn with_notifications(mut self, hub: Arc<NotifyHub>) -> Self {
+        self.notify = Some(hub);
+        self
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut Inner<K, S>) -> R) -> R {
@@ -958,13 +974,37 @@ where
         let mut cursor = baseline;
         let mut seen_busy = false;
         let mut last_text: Option<String> = None;
+        let mut wake = self.notify.as_ref().map(|h| h.subscribe());
+        let mut last_approval_poll = Instant::now();
         loop {
-            tokio::time::sleep(self.settings.poll_interval).await;
-            match self.next_pending(sid, ignore).await {
-                Ok(Some(row)) => return self.show_approval(chat, sid, &row).await,
-                Ok(None) => {}
-                Err(e) if e.is_retryable() => debug!("transient error while watching: {e}"),
-                Err(e) => return self.report(chat, &Fail::Tole(e)).await,
+            // A recorded event ends the wait early; the interval is the
+            // fallback when none arrives.
+            match wake.as_mut() {
+                Some(w) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(self.settings.poll_interval) => {}
+                        _ = w.changed() => {}
+                    }
+                }
+                None => tokio::time::sleep(self.settings.poll_interval).await,
+            }
+            if let Some(row) = self.notified_approval(sid, ignore) {
+                return self.show_approval(chat, sid, &row).await;
+            }
+            // With the receiver on, open approvals are polled only as a slow
+            // fallback; without it, every round.
+            let poll_approvals = self
+                .notify
+                .as_ref()
+                .is_none_or(|h| last_approval_poll.elapsed() >= h.fallback_poll());
+            if poll_approvals {
+                last_approval_poll = Instant::now();
+                match self.next_pending(sid, ignore).await {
+                    Ok(Some(row)) => return self.show_approval(chat, sid, &row).await,
+                    Ok(None) => {}
+                    Err(e) if e.is_retryable() => debug!("transient error while watching: {e}"),
+                    Err(e) => return self.report(chat, &Fail::Tole(e)).await,
+                }
             }
             // Status first, then the log: when the status says idle, the log
             // read that follows already holds the final answer.
@@ -1011,7 +1051,10 @@ where
                 || started.elapsed() >= self.settings.resume_grace
             {
                 // The turn may have parked on another approval in the instant
-                // between the two reads above.
+                // between the two reads above. An announced one comes first.
+                if let Some(row) = self.notified_approval(sid, ignore) {
+                    return self.show_approval(chat, sid, &row).await;
+                }
                 if let Ok(Some(row)) = self.next_pending(sid, ignore).await {
                     return self.show_approval(chat, sid, &row).await;
                 }
@@ -1034,6 +1077,13 @@ where
                     .await;
             }
         }
+    }
+
+    /// An approval of the session that a verified webhook announced.
+    fn notified_approval(&self, sid: &str, ignore: &[String]) -> Option<ApprovalRow> {
+        self.notify
+            .as_ref()?
+            .take_requested(sid, ignore, self.clock.now_ms())
     }
 
     /// The first pending approval of the session that is not in `ignore`.
