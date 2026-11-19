@@ -24,8 +24,10 @@ lost on a serve restart). After an Allow the gateway waits like this:
    read before the decision (the baseline) ends the wait. At the baseline
    itself only the leg that stopped on the approval just decided is stale; any
    other end there is a resumed leg that failed before writing anything.
-   - `completed`: one authenticated read of the log entries after the baseline;
-     the last assistant message is the answer.
+   - `completed`: one authenticated read of the log entries after the cursor
+     (the baseline, or as far as a fallback poll already read); the last
+     assistant message after the baseline is the answer, whether this read or
+     an earlier poll found it.
    - `approval_pending`: the announced approval, or one read of
      `GET /approvals?session=` when the announcement was lost.
    - `cancelled`, `detached`, `budget_exhausted`, `failed`, `blocked`: a fixed
