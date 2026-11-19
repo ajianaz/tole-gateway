@@ -12,7 +12,7 @@ decided through tole's single gate (`POST /approvals/{id}/decision`).
 | --- | --- |
 | `approval_requested` | After an Allow, an approval raised by the resumed turn is shown with its buttons at once, without polling `GET /approvals?session=`. The summary is untrusted text, shown as plain text. |
 | `approval_resolved` | Remembered, so a late or reordered `approval_requested` for an approval that already closed is dropped (events carry no order). |
-| `turn_finished` | Verified like every event, then its ids are checked (the `id` must be `turn:<session>:<hash16>:<last_seq>[:<settle>]` for the `session_id` and `last_seq` in `data`), and the latest end of each session is kept by `(last_seq, settle)`, so a late older event never replaces a newer one. It carries no text. A status or code word the gateway does not know yet is kept as "other" and acknowledged. Not yet used by the dispatcher. |
+| `turn_finished` | Verified like every event, then its ids are checked (the `id` must be `turn:<session>:<hash16>:<last_seq>[:<settle>]` for the `session_id` and `last_seq` in `data`), and the latest end of each session is kept by `(last_seq, at, settle)` (`at` is the envelope time; the settle counter restarts with tole, so it only breaks a tie), so a late older event never replaces a newer one, also across a tole restart. It carries no text. A status or code word the gateway does not know yet is kept as "other" and acknowledged. Not yet used by the dispatcher. |
 | `cron_run_finished`, `webhook_test`, anything else | Acknowledged (`200`) and ignored: the gateway has no cron presentation yet. |
 
 An event carries a pointer, not the assistant's answer. tole's `turn_finished`

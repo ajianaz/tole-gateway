@@ -224,7 +224,7 @@ async fn handle(State(s): State<Arc<Shared>>, req: Request) -> Response {
         debug!("authenticated webhook body disagrees with its headers or this destination");
         return status(StatusCode::BAD_REQUEST);
     }
-    let action = match parse_event(hdrs.event, hdrs.id, &doc["data"]) {
+    let action = match parse_event(hdrs.event, hdrs.id, &doc) {
         Ok(a) => a,
         Err(()) => return status(StatusCode::BAD_REQUEST),
     };
@@ -265,7 +265,8 @@ fn id_field(d: &Value, key: &str) -> Option<String> {
     text(d, key).filter(|s| verify::valid_token(s, 128))
 }
 
-fn parse_event(event: &str, id: &str, data: &Value) -> Result<Action, ()> {
+fn parse_event(event: &str, id: &str, doc: &Value) -> Result<Action, ()> {
+    let data = &doc["data"];
     match event {
         "approval_requested" => Ok(Action::Requested(Requested {
             approval_id: id_field(data, "approval_id").ok_or(())?,
@@ -278,7 +279,10 @@ fn parse_event(event: &str, id: &str, data: &Value) -> Result<Action, ()> {
             expires_at: data.get("expires_at").and_then(Value::as_u64).unwrap_or(0),
         })),
         "approval_resolved" => Ok(Action::Resolved(id_field(data, "approval_id").ok_or(())?)),
-        "turn_finished" => Ok(Action::Turn(turn::parse(id, data).ok_or(())?)),
+        "turn_finished" => {
+            let at = doc.get("at").and_then(Value::as_u64).ok_or(())?;
+            Ok(Action::Turn(turn::parse(id, at, data).ok_or(())?))
+        }
         _ => Ok(Action::Ignored),
     }
 }
