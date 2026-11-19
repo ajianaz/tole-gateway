@@ -58,10 +58,15 @@ logic. Sessions, tools, approvals, budgets and storage stay in tole.
   [codecoradev/tole#911](https://github.com/codecoradev/tole/issues/911)). The
   gateway therefore holds no SSE stream per session; the server caps streams at
   8.
-- Until that exists, the gateway polls `GET /approvals?session=` and
-  `GET /sessions/{id}/status` after every allow, then reads the new log entries
-  for the answer (a resumed turn has no HTTP response). Polling `GET /cron/runs`
-  is not implemented yet.
+- The receiver (`[notify]`, [notify.md](notify.md)) is optional and off by
+  default. With it on, an `approval_requested` event shows an approval raised
+  by a resumed turn without polling for it. tole defines no "turn finished"
+  event, so after every allow the gateway still reads
+  `GET /sessions/{id}/status` and the new log entries for the answer (a
+  resumed turn has no HTTP response), and polls `GET /approvals?session=` as a
+  slow fallback (every `fallback_poll_secs`). With the receiver off, polling is
+  as before. `cron_run_finished` is acknowledged and ignored; presenting cron
+  results, and polling `GET /cron/runs`, are not implemented yet.
 - Incoming deliveries are verified (signature and freshness) before anything
   is shown.
 
@@ -83,7 +88,7 @@ when the roadmap step that needs them lands:
 | `sessions` | Chat-to-session index and the 4-hour rollover rule. |
 | `approvals` | Render approval rows as buttons; map answers to allow or deny; timeouts are denials. |
 | `telegram` | Telegram adapter (long polling, rendering, buttons). |
-| `notify` | Webhook receiver and, until it exists, polling of approvals and cron runs. |
+| `notify` | Optional webhook receiver (verify, dedupe, hub of announced approvals); polling stays as the fallback. |
 
 When the Discord adapter arrives, the common adapter trait is extracted from
 the two concrete adapters and the workspace may split into a library crate plus
@@ -96,7 +101,7 @@ the binary.
 | G1 | Repository bootstrap: workspace skeleton, CI and governance checks, docs. | done |
 | G2 | Telegram adapter: long polling, allowlist and pairing, one chat = one session, `/new`, 4-hour rollover. | implemented, tested against fakes; live Telegram check pending |
 | G3 | Approvals from chat: inline buttons, denial on timeout, polling fallback. | implemented, tested against fakes |
-| G4 | Cron results and notifications through the signed webhook delivery target; second channel (Discord) and the adapter seam extraction. | planned |
+| G4 | Cron results and notifications through the signed webhook delivery target; second channel (Discord) and the adapter seam extraction. | webhook receiver for approval events implemented, tested against fakes (real `tole serve` with `[webhook_out]` not run yet); cron results, Discord and the seam extraction planned |
 | G5 | Web dashboard. | later |
 
 ## Known limitations

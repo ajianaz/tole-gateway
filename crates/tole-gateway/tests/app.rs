@@ -15,6 +15,7 @@ use tole_gateway::app::{Announce, App, AppSettings};
 use tole_gateway::auth::{Authorizer, PairingCode, PairingCodeSource, PairingError};
 use tole_gateway::channel::{ChatId, Inbound, UserId};
 use tole_gateway::config::ToleAuth;
+use tole_gateway::notify::{sign, NotifyHub, Receiver, ReceiverConfig};
 use tole_gateway::secret::Secret;
 use tole_gateway::sessions::{Clock, SessionIndex};
 use tole_gateway::telegram::{TelegramAdapter, TelegramConfig};
@@ -70,6 +71,14 @@ async fn rig(allowed: &[i64]) -> Rig {
 }
 
 async fn rig_with(allowed: &[i64], tweak: impl FnOnce(&mut AppSettings)) -> Rig {
+    rig_full(allowed, tweak, None).await
+}
+
+async fn rig_full(
+    allowed: &[i64],
+    tweak: impl FnOnce(&mut AppSettings),
+    hub: Option<Arc<NotifyHub>>,
+) -> Rig {
     let tole = FakeTole::start().await;
     tole.require_bearer(TOLE_TOKEN);
     let tg = FakeTelegram::start().await;
@@ -115,7 +124,7 @@ async fn rig_with(allowed: &[i64], tweak: impl FnOnce(&mut AppSettings)) -> Rig 
         ..AppSettings::default()
     };
     tweak(&mut settings);
-    let app = Arc::new(App::new(
+    let mut app = App::new(
         client,
         adapter.clone(),
         clock.clone(),
@@ -124,7 +133,11 @@ async fn rig_with(allowed: &[i64], tweak: impl FnOnce(&mut AppSettings)) -> Rig 
         index,
         allowed.is_empty(),
         announce,
-    ));
+    );
+    if let Some(hub) = hub {
+        app = app.with_notifications(hub);
+    }
+    let app = Arc::new(app);
     Rig {
         tole,
         tg,
@@ -910,4 +923,158 @@ async fn the_run_loop_serves_telegram_updates_end_to_end() {
         .unwrap();
     // The bot token appears only in request paths, never in any message.
     assert_no_secrets(&r);
+}
+
+// ------------------------------------------------------ tole webhooks (G4)
+
+const HOOK_KEY: &str = "tole-test-key-0123456789abcdef";
+
+/// A receiver wired to a hub, listening on loopback; returns its base URL.
+async fn start_receiver(hub: &Arc<NotifyHub>) -> String {
+    let receiver = Receiver::new(
+        ReceiverConfig {
+            key: Secret::new(HOOK_KEY),
+            path: "/tole/events".into(),
+            destination: "gateway".into(),
+            max_body_bytes: 64 * 1024,
+        },
+        Arc::clone(hub),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(receiver.serve(listener, std::future::pending()));
+    url
+}
+
+/// Play tole: POST a signed `approval_requested` for `session`.
+async fn post_requested(url: &str, key: &str, approval: &str, session: &str) -> u16 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let id = format!("approval:{approval}:requested");
+    let body = serde_json::json!({
+        "v": 1, "id": id, "type": "approval_requested", "destination": "gateway", "at": now,
+        "data": {"source": "serve", "approval_id": approval, "session_id": session,
+                 "tool": "write_file", "risk": "write", "summary": "write more.md",
+                 "truncated": false, "created_at": now, "expires_at": now + 900}
+    });
+    let body = serde_json::to_vec(&body).unwrap();
+    let ts = now.to_string();
+    reqwest::Client::new()
+        .post(format!("{url}/tole/events"))
+        .header("X-Tole-Timestamp", &ts)
+        .header("X-Tole-Delivery", &id)
+        .header("X-Tole-Event", "approval_requested")
+        .header(
+            "X-Tole-Signature",
+            sign(&Secret::new(key), &ts, &id, "approval_requested", &body),
+        )
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// The requests the fake tole saw after the first decision POST.
+fn requests_after_decision(tole: &FakeTole) -> Vec<String> {
+    let all = tole.requests();
+    let at = all
+        .iter()
+        .position(|q| q.method == "POST" && q.path.ends_with("/decision"))
+        .expect("a decision was sent");
+    all[at + 1..]
+        .iter()
+        .map(|q| format!("{} {}", q.method, q.path))
+        .collect()
+}
+
+#[tokio::test]
+async fn an_allow_followed_by_a_webhook_shows_the_next_approval_without_any_poll() {
+    let hub = Arc::new(NotifyHub::new(Duration::from_secs(3600)));
+    // A poll interval far longer than the test: only the webhook can wake it.
+    let r = rig_full(
+        &[OWNER],
+        |s| s.poll_interval = Duration::from_secs(120),
+        Some(hub.clone()),
+    )
+    .await;
+    let url = start_receiver(&hub).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write the notes")).await;
+    let allow = button(&r.tg, 0);
+    let task = press_in_task(&r, &allow);
+    wait_until("the decision", || !r.tole.decisions().is_empty()).await;
+
+    // The resumed turn stops on a further approval; tole announces it.
+    r.tole
+        .add_approval("apr-2", "srv-1", "write_file", "write more.md");
+    assert_eq!(post_requested(&url, HOOK_KEY, "apr-2", "srv-1").await, 200);
+    wait_until("the second approval", || {
+        count_text(&r.tg, "Approval needed") == 2
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        requests_after_decision(&r.tole),
+        Vec::<String>::new(),
+        "no poll of approvals, status or entries after the allow"
+    );
+    // The row is decided through the one gate, like a polled one.
+    let deny = button(&r.tg, 1);
+    r.app.handle(press(OWNER, OWNER, &deny)).await;
+    assert_eq!(
+        r.tole.decisions().last().unwrap(),
+        &("apr-2".to_owned(), "deny".to_owned())
+    );
+    assert_no_secrets(&r);
+}
+
+#[tokio::test]
+async fn a_forged_webhook_shows_nothing_and_polling_still_finishes_the_turn() {
+    let hub = Arc::new(NotifyHub::new(Duration::from_secs(3600)));
+    let r = rig_full(&[OWNER], |_| {}, Some(hub.clone())).await;
+    let url = start_receiver(&hub).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write the notes")).await;
+    let allow = button(&r.tg, 0);
+    let task = press_in_task(&r, &allow);
+    wait_until("the decision", || !r.tole.decisions().is_empty()).await;
+    assert_eq!(
+        post_requested(&url, "a-forged-key-0123456789ab", "apr-9", "srv-1").await,
+        401
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        count_text(&r.tg, "Approval needed"),
+        1,
+        "a forged event shows nothing"
+    );
+    r.tole.add_message("srv-1", "assistant", "notes written");
+    task.await.unwrap();
+    assert_eq!(texts(&r.tg).last().unwrap(), "notes written");
+}
+
+#[tokio::test]
+async fn without_a_webhook_the_slow_fallback_poll_still_finds_the_next_approval() {
+    let hub = Arc::new(NotifyHub::new(Duration::from_millis(60)));
+    let r = rig_full(&[OWNER], |_| {}, Some(hub)).await;
+    script_approval(&r.tole, "apr-1");
+    r.app.handle(msg(OWNER, OWNER, "write the notes")).await;
+    let allow = button(&r.tg, 0);
+    let task = press_in_task(&r, &allow);
+    wait_until("the decision", || !r.tole.decisions().is_empty()).await;
+    r.tole
+        .add_approval("apr-2", "srv-1", "write_file", "write more.md");
+    wait_until("the second approval", || {
+        count_text(&r.tg, "Approval needed") == 2
+    })
+    .await;
+    task.await.unwrap();
 }

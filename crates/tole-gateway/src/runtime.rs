@@ -11,6 +11,7 @@ use crate::auth::{Authorizer, OsPairingCodeSource};
 use crate::channel::UserId;
 use crate::config::{Config, EnvFn};
 use crate::error::ToleError;
+use crate::notify::{self, NotifyHub, Receiver, ReceiverConfig};
 use crate::sessions::{SessionIndex, SystemClock};
 use crate::telegram::{TelegramAdapter, TelegramConfig};
 use crate::tole_client::{HttpToleClient, ToleApi, ToleClientConfig};
@@ -35,6 +36,12 @@ pub async fn run_gateway(
     let tole_auth = cfg.tole_auth(env).map_err(|e| e.to_string())?;
     let bot_token = cfg.bot_token(env).map_err(|e| e.to_string())?;
     let state_dir = cfg.state_dir(env).map_err(|e| e.to_string())?;
+    // Off by default: nothing is read or bound unless `[notify] enabled`.
+    let webhook_key = if cfg.notify.enabled {
+        Some(cfg.webhook_key(env).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
 
     let tole = HttpToleClient::new(ToleClientConfig {
         base_url: cfg.tole.url.clone(),
@@ -109,7 +116,7 @@ pub async fn run_gateway(
         cfg.sessions.rollover_hours,
         cfg.auth.allowed_user_ids.len()
     );
-    let app = Arc::new(App::new(
+    let mut app = App::new(
         tole,
         adapter.clone(),
         SystemClock,
@@ -118,8 +125,40 @@ pub async fn run_gateway(
         index,
         pairing_mode,
         announce,
-    ));
+    );
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let mut receiver_task = None;
+    if let (Some(key), Some(addr)) = (webhook_key, cfg.notify_addr()) {
+        let hub = Arc::new(NotifyHub::new(Duration::from_secs(
+            cfg.notify.fallback_poll_secs,
+        )));
+        let listener = notify::bind(addr)
+            .await
+            .map_err(|e| format!("cannot bind the webhook receiver on {addr}: {e}"))?;
+        let receiver = Receiver::new(
+            ReceiverConfig {
+                key,
+                path: cfg.notify.path.clone(),
+                destination: cfg.notify.destination.clone(),
+                max_body_bytes: cfg.notify.max_body_bytes,
+            },
+            Arc::clone(&hub),
+        );
+        let wait = Arc::clone(&stop);
+        receiver_task = Some(tokio::spawn(async move {
+            let done = async move { wait.notified().await };
+            if let Err(e) = receiver.serve(listener, done).await {
+                warn!("the webhook receiver stopped: {e}");
+            }
+        }));
+        app = app.with_notifications(hub);
+    }
+    let app = Arc::new(app);
     app.run(&adapter, shutdown_signal()).await;
+    stop.notify_one();
+    if let Some(t) = receiver_task {
+        let _ = t.await;
+    }
     Ok(CheckReport { tole_reachable })
 }
 
