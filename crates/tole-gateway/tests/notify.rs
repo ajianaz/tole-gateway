@@ -128,7 +128,13 @@ async fn every_refusal_looks_the_same_and_applies_nothing() {
     let good = Req::signed(&id, &ev, &body, NOW);
 
     let mut bad_sig = Req::signed(&id, &ev, &body, NOW);
-    bad_sig.sig = bad_sig.sig.map(|s| format!("{}0", &s[..s.len() - 1]));
+    // Change the last hex digit to a DIFFERENT one: appending a fixed '0'
+    // would leave a signature that ends in '0' unchanged (1 run in 16).
+    bad_sig.sig = bad_sig.sig.map(|s| {
+        let (head, last) = s.split_at(s.len() - 1);
+        let other = if last == "0" { "1" } else { "0" };
+        format!("{head}{other}")
+    });
     let mut missing_sig = Req::signed(&id, &ev, &body, NOW);
     missing_sig.sig = None;
     let mut missing_ts = Req::signed(&id, &ev, &body, NOW);
