@@ -28,7 +28,8 @@ TOLE_BIN=/path/to/tole/target/debug/tole \
 
 Every test is `#[ignore = "needs TOLE_BIN"]`, so a plain
 `cargo test --workspace` neither needs tole nor runs these. Tested against
-tole 0.11.0.
+tole 0.11.0 for the non-webhook tests; the `webhook_*` tests need `turn_finished`
+(see "In CI" for the pinned build).
 
 Each test starts its own `tole serve` on `127.0.0.1:<free port>` with
 `--token-file`, `--no-auto-mcp`, a temp workspace and a temp `--sessions-dir`.
@@ -38,6 +39,45 @@ The child gets `env_clear()` plus only `PATH`, `HOME`, `CODECORA_HOME`, the
 variable, user config or real key reaches it. No `--allow` is given, so every
 Write tool call parks in the approval queue. The test waits for `GET /health`,
 kills the child on drop, and prints the child's stderr when a test fails.
+
+## In CI
+
+`.github/workflows/e2e.yml` (job `E2E (real tole)`) runs the command above on
+every push and pull request to `develop` and `main`, and on manual dispatch.
+It is not in the required status checks of `docs/repo-settings.md`: a failure
+shows as a red check but does not block merging, until the job has proven
+stable. Permissions are `contents: read`; no secret is used.
+
+What it downloads and builds, and from where:
+
+- tole, built from source: `cargo install tole-cli --git
+  https://github.com/codecoradev/tole --rev <TOLE_REV> --locked`. The source
+  comes from GitHub at that one commit; tole's own committed `Cargo.lock` is
+  enforced by `--locked`, so its dependencies come from crates.io at the
+  locked versions and nothing is resolved at CI time. The binary lands in
+  `$RUNNER_TEMP/tole-bin/bin/tole`, which is `TOLE_BIN`. It is cached with
+  `actions/cache` under a key containing the SHA, so the build (about 5
+  minutes on 4 cores) runs again only when the pin changes.
+- Rust toolchain, `actions/checkout`, `actions/cache` and `Swatinem/rust-cache`
+  as in the other workflows (tags, like `ci.yml`).
+
+Why a commit SHA and not a release: the webhook tests need tole's
+`turn_finished` event (tole #962, commit `0486494ef2`), which is on tole's
+`develop` but in no release yet (v0.11.0 lacks it). The pin is a full SHA
+because a branch moves under CI and a tag can be re-pointed. The SHA in use
+descends from the #962 commit (checked with the GitHub compare API). Note
+`tole --version` prints the workspace version `0.11.0` for this build, so it
+does not tell the pinned commit apart from the release; the SHA in the
+workflow is the source of truth.
+
+Bumping the pin: change `TOLE_REV` in `.github/workflows/e2e.yml` to the full
+SHA of the new tole commit, then run the command above locally against a tole
+built from that SHA (`cargo install tole-cli --git
+https://github.com/codecoradev/tole --rev <sha> --locked --root <dir>`) and
+put the result in the PR. Once tole publishes a release that contains
+`turn_finished`, switch the step to `cargo install tole-cli --version <x.y.z>
+--locked` and drop the git source. Review the diff of tole between the old and
+new SHA first: this code runs in CI.
 
 ## What the tests prove
 

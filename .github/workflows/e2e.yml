@@ -1,0 +1,75 @@
+name: E2E
+
+# Runs the `#[ignore = "needs TOLE_BIN"]` tests of crates/tole-gateway/tests/e2e.rs
+# against a REAL `tole serve`. See docs/e2e.md ("In CI") for what is built and
+# how to bump the pin.
+#
+# The job is deliberately not in the required status checks (docs/repo-settings.md)
+# until it has been stable for a while: a failure shows as a red check but does
+# not block merging.
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # The tole build under test. The pin is a full commit SHA of
+  # github.com/codecoradev/tole, never a branch or a tag name that can move.
+  # It must contain tole #962 (`turn_finished`), which no release has yet
+  # (v0.11.0 lacks it). 0486494ef2 is the commit that added it; this SHA is a
+  # later commit on develop (321 commits after v0.11.0), verified to descend from it.
+  # To bump: see docs/e2e.md.
+  TOLE_REPO: https://github.com/codecoradev/tole
+  TOLE_REV: b4c745c441503821939960d0d6cdc9703e237b84
+
+jobs:
+  e2e:
+    name: E2E (real tole)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The tole binary is cached by the pinned SHA: a changed pin is a cache
+      # miss and rebuilds, an unchanged pin skips the (slow) build.
+      - name: Restore the pinned tole build
+        id: tole-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/tole-bin
+          key: tole-${{ runner.os }}-${{ env.TOLE_REV }}
+
+      # Builds from source at the pinned commit with the lockfile tole itself
+      # committed (--locked): nothing is resolved at CI time. Network use: the
+      # git fetch of TOLE_REPO at TOLE_REV and crates.io for tole's locked
+      # dependencies. No secret is passed to the build.
+      - name: Build tole at the pinned commit
+        if: steps.tole-cache.outputs.cache-hit != 'true'
+        run: >
+          cargo install tole-cli
+          --git "$TOLE_REPO" --rev "$TOLE_REV"
+          --locked --root "$RUNNER_TEMP/tole-bin"
+        env:
+          CARGO_INCREMENTAL: "0"
+
+      - name: Check the tole binary
+        run: |
+          test -x "$RUNNER_TEMP/tole-bin/bin/tole"
+          "$RUNNER_TEMP/tole-bin/bin/tole" --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the e2e tests against the real tole
+        run: cargo test -p tole-gateway --test e2e -- --ignored --test-threads=1
+        env:
+          TOLE_BIN: ${{ runner.temp }}/tole-bin/bin/tole
