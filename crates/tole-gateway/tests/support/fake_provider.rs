@@ -10,7 +10,10 @@
 //! The behavior is stateless and driven by the request:
 //!
 //! - the last message has role `tool`: a final text `done: <path>` (the path
-//!   comes from the most recent `WRITE <path>` in the conversation);
+//!   comes from the most recent `WRITE <path>` in the conversation); with
+//!   `WRITE a.md ALSO b.md`, the first finished write is followed by a call
+//!   for `b.md` (a second approval raised by the resumed turn) and the final
+//!   text names `b.md`;
 //! - the last user message contains `WRITE <relative path>`: a `tool_calls`
 //!   answer calling `write_file` with `{"path": <path>, "content": ...}`;
 //! - the last user message is tole's denial note (`[tole] Your call to ...`),
@@ -115,6 +118,20 @@ fn write_path(text: &str) -> Option<String> {
     Some(path.to_owned())
 }
 
+/// Every file a request asks for: the path after `WRITE `, then the one after
+/// `ALSO ` when present.
+fn write_paths(text: &str) -> Option<Vec<String>> {
+    let mut out = vec![write_path(text)?];
+    if let Some(p) = text
+        .split("ALSO ")
+        .nth(1)
+        .and_then(|r| r.split_whitespace().next())
+    {
+        out.push(p.to_owned());
+    }
+    Some(out)
+}
+
 async fn completions(
     State(shared): State<Arc<Shared>>,
     headers: HeaderMap,
@@ -141,29 +158,43 @@ async fn completions(
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    let message = if last_is_tool {
-        let path = messages
-            .iter()
-            .rev()
-            .filter(|m| m["role"] == "user")
-            .find_map(|m| write_path(&content_text(&m["content"])))
-            .unwrap_or_default();
-        json!({"role": "assistant", "content": format!("done: {path}")})
-    } else if let Some(path) = write_path(&last_user).or_else(|| {
-        // After tole's denial note, repeat the last WRITE the user asked for.
-        last_user.starts_with(DENIAL_NOTE_PREFIX).then(|| {
-            messages
-                .iter()
-                .rev()
-                .filter(|m| m["role"] == "user")
-                .find_map(|m| write_path(&content_text(&m["content"])))
-                .unwrap_or_default()
-        })
-    }) {
+    // The files the user asked for: `WRITE a.md` or `WRITE a.md ALSO b.md`.
+    let ask = messages
+        .iter()
+        .rev()
+        .filter(|m| m["role"] == "user")
+        .find_map(|m| write_paths(&content_text(&m["content"])));
+    let tool_call = |path: &str, n: usize| {
         let args = json!({"path": path, "content": WRITE_CONTENT}).to_string();
         json!({"role": "assistant", "content": null, "tool_calls": [{
-            "id": "call_write_1", "type": "function",
+            "id": format!("call_write_{n}"), "type": "function",
             "function": {"name": "write_file", "arguments": args}}]})
+    };
+    let message = if last_is_tool {
+        // One tool result per finished write: the next file, or the answer.
+        let paths = ask.unwrap_or_default();
+        let done = messages.iter().filter(|m| m["role"] == "tool").count();
+        match paths.get(done) {
+            Some(next) => tool_call(next, done + 1),
+            None => json!({"role": "assistant",
+                "content": format!("done: {}", paths.last().cloned().unwrap_or_default())}),
+        }
+    } else if let Some(paths) = write_paths(&last_user) {
+        tool_call(&paths[0], 1)
+    } else if last_user.starts_with(DENIAL_NOTE_PREFIX) {
+        // After tole's denial note, repeat the call that was parked: the
+        // n-th note in the history belongs to the n-th file asked for.
+        let notes = messages
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .filter(|m| content_text(&m["content"]).starts_with(DENIAL_NOTE_PREFIX))
+            .count();
+        let paths = ask.unwrap_or_default();
+        let path = paths
+            .get(notes.saturating_sub(1))
+            .cloned()
+            .unwrap_or_default();
+        tool_call(&path, notes)
     } else {
         json!({"role": "assistant", "content": format!("echo: {last_user}")})
     };

@@ -102,7 +102,7 @@ the binary.
 | G1 | Repository bootstrap: workspace skeleton, CI and governance checks, docs. | done |
 | G2 | Telegram adapter: long polling, allowlist and pairing, one chat = one session, `/new`, 4-hour rollover. | implemented, tested against fakes; live Telegram check pending |
 | G3 | Approvals from chat: inline buttons, denial on timeout, polling fallback. | implemented, tested against fakes |
-| G4 | Cron results and notifications through the signed webhook delivery target; second channel (Discord) and the adapter seam extraction. | webhook receiver for approval and `turn_finished` events implemented, tested against fakes (real `tole serve` with `[webhook_out]` not run yet); cron results, Discord and the seam extraction planned |
+| G4 | Cron results and notifications through the signed webhook delivery target; second channel (Discord) and the adapter seam extraction. | webhook receiver for approval and `turn_finished` events implemented, tested against fakes and against a real `tole serve` with a `[webhook_out]` destination ([e2e.md](e2e.md)); cron results, Discord and the seam extraction planned |
 | G5 | Web dashboard. | later |
 
 ## Known limitations

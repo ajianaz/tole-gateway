@@ -10,6 +10,11 @@
 //! TOLE_BIN=/path/to/tole cargo test -p tole-gateway --test e2e -- --ignored --test-threads=1
 //! ```
 //!
+//! The `webhook_*` tests also give tole a `[webhook_out.gateway]` destination
+//! that points at the gateway's real receiver (`notify::Receiver`, on an
+//! ephemeral loopback port), signed with a key tole reads from an environment
+//! variable: events travel from the real binary to the real receiver.
+//!
 //! See `docs/e2e.md`.
 
 #[path = "support/fake_provider.rs"]
@@ -28,6 +33,7 @@ use tole_gateway::app::{Announce, App, AppSettings};
 use tole_gateway::auth::{Authorizer, PairingCode, PairingCodeSource, PairingError};
 use tole_gateway::channel::UserId;
 use tole_gateway::config::ToleAuth;
+use tole_gateway::notify::{sign, NotifyHub, Receiver, ReceiverConfig, TurnStatus};
 use tole_gateway::secret::Secret;
 use tole_gateway::sessions::{SessionIndex, SystemClock};
 use tole_gateway::telegram::{TelegramAdapter, TelegramConfig};
@@ -41,6 +47,9 @@ const OWNER: i64 = 42;
 const TOLE_TOKEN: &str = "e2e-tole-token-0123456789";
 const BOT_TOKEN: &str = "123456:E2E-BOT-TOKEN";
 const PROVIDER_KEY: &str = "e2e-provider-key";
+/// The signing key shared by tole's `[webhook_out.gateway]` and the receiver.
+const WEBHOOK_KEY: &str = "e2e-webhook-key-0123456789abcdef";
+const WEBHOOK_PATH: &str = "/tole/events";
 
 // --------------------------------------------------------------- real tole
 
@@ -154,6 +163,7 @@ async fn spawn_tole(env: &ToleEnv, provider_url: &str, log_name: &str) -> Tole {
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .env("TOLE_BASE_URL", provider_url)
         .env("TOLE_API_KEY", PROVIDER_KEY)
+        .env("TOLE_E2E_WEBHOOK_KEY", WEBHOOK_KEY)
         .env("TOLE_MODEL", "fake-model")
         .env("TOLE_STREAM", "0")
         .stdin(Stdio::null())
@@ -208,12 +218,41 @@ struct Rig {
     runner: tokio::task::JoinHandle<()>,
     next_log: u32,
     _state: TempDir,
+    /// The receiver's hub and address, when the gateway runs it.
+    hub: Option<Arc<NotifyHub>>,
+    receiver: Option<tokio::task::JoinHandle<()>>,
+    /// The port tole's `[webhook_out.gateway]` points at (0: no destination).
+    hook_port: u16,
 }
 
 impl Drop for Rig {
     fn drop(&mut self) {
         self.runner.abort();
+        if let Some(r) = &self.receiver {
+            r.abort();
+        }
     }
+}
+
+/// How the webhook path is set up for a test.
+#[derive(Clone, Copy)]
+struct Hooks {
+    /// The gateway runs its receiver (else tole points at a closed port).
+    receiver: bool,
+    /// tole's `events` list for the destination.
+    events: &'static str,
+    /// The gateway's `fallback_poll_secs`.
+    fallback_secs: u64,
+}
+
+impl Hooks {
+    /// Receiver on, every event listed, and a fallback poll so slow (10
+    /// minutes) that an answer inside the test's wait can only be an event.
+    const EVENTS: Hooks = Hooks {
+        receiver: true,
+        events: r#"["approval_requested", "approval_resolved", "turn_finished"]"#,
+        fallback_secs: 600,
+    };
 }
 
 fn client_for(env: &ToleEnv) -> HttpToleClient {
@@ -228,9 +267,50 @@ fn client_for(env: &ToleEnv) -> HttpToleClient {
 
 impl Rig {
     async fn start() -> Rig {
+        Self::start_with(None).await
+    }
+
+    async fn start_with(hooks: Option<Hooks>) -> Rig {
         let provider = FakeProvider::start().await;
         let tg = FakeTelegram::start().await;
         let env = ToleEnv::new();
+        // The receiver binds first: tole's config needs its port.
+        let (mut hub, mut receiver, mut hook_port) = (None, None, 0);
+        if let Some(h) = hooks {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            hook_port = listener.local_addr().unwrap().port();
+            if h.receiver {
+                let new_hub = Arc::new(NotifyHub::new(Duration::from_secs(h.fallback_secs)));
+                let rx = Receiver::new(
+                    ReceiverConfig {
+                        key: Secret::new(WEBHOOK_KEY),
+                        path: WEBHOOK_PATH.to_owned(),
+                        destination: "gateway".to_owned(),
+                        max_body_bytes: 65536,
+                    },
+                    Arc::clone(&new_hub),
+                );
+                receiver = Some(tokio::spawn(async move {
+                    let _ = rx.serve(listener, std::future::pending()).await;
+                }));
+                hub = Some(new_hub);
+            } else {
+                // Nothing listens: the port is closed again at once.
+                drop(listener);
+            }
+            let conf = env.root.path().join("home/tole");
+            std::fs::create_dir_all(&conf).unwrap();
+            std::fs::write(
+                conf.join("config.toml"),
+                format!(
+                    "[webhook_out.gateway]\nurl = \"http://127.0.0.1:{hook_port}{WEBHOOK_PATH}\"\n\
+                     hmac_key_env = \"TOLE_E2E_WEBHOOK_KEY\"\nevents = {}\n\
+                     allow_loopback = true\n",
+                    h.events
+                ),
+            )
+            .unwrap();
+        }
         let tole = spawn_tole(&env, &provider.url(), "tole-1.stderr").await;
         let state = TempDir::new().unwrap();
         let adapter = TelegramAdapter::new(TelegramConfig {
@@ -258,7 +338,7 @@ impl Rig {
             sweep_interval: Duration::from_secs(3600),
             ..AppSettings::default()
         };
-        let app = Arc::new(App::new(
+        let mut app = App::new(
             client_for(&env),
             adapter.clone(),
             SystemClock,
@@ -267,7 +347,11 @@ impl Rig {
             index,
             false,
             announce,
-        ));
+        );
+        if let Some(h) = &hub {
+            app = app.with_notifications(Arc::clone(h));
+        }
+        let app = Arc::new(app);
         let runner = {
             let app = Arc::clone(&app);
             tokio::spawn(async move {
@@ -284,6 +368,9 @@ impl Rig {
             runner,
             next_log: 2,
             _state: state,
+            hub,
+            receiver,
+            hook_port,
         }
     }
 
@@ -546,6 +633,310 @@ async fn cancel_stops_a_slow_turn() {
     rig.say("again");
     rig.wait_text("answer after cancel", |t| t == "echo: again")
         .await;
+    rig.assert_no_secrets();
+}
+
+// ------------------------------------------ real tole -> real receiver
+
+/// Poll `check` until it holds (40 s at most).
+async fn until(what: &str, check: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !check() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+impl Rig {
+    /// The id of the one session on disk.
+    fn only_session(&self) -> String {
+        let files = session_files(&self.env.sessions());
+        assert_eq!(files.len(), 1, "{files:?}");
+        files[0].clone()
+    }
+
+    /// A raw POST to the gateway's receiver; returns status and body.
+    async fn post_hook(&self, headers: &[(&str, &str)], body: &str) -> (u16, String) {
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut req = http
+            .post(format!("http://127.0.0.1:{}{WEBHOOK_PATH}", self.hook_port))
+            .body(body.to_owned());
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let resp = req.send().await.unwrap();
+        (resp.status().as_u16(), resp.text().await.unwrap())
+    }
+
+    /// Send a delivery for `event` the way tole does, signed with `key` as of
+    /// `ts` (unix seconds).
+    async fn deliver(
+        &self,
+        key: &str,
+        ts: u64,
+        event: &str,
+        id: &str,
+        data: Value,
+    ) -> (u16, String) {
+        let body = json!({"v": 1, "id": id, "type": event, "destination": "gateway",
+            "at": ts, "data": data})
+        .to_string();
+        let ts = ts.to_string();
+        let sig = sign(&Secret::new(key), &ts, id, event, body.as_bytes());
+        self.post_hook(
+            &[
+                ("X-Tole-Timestamp", &ts),
+                ("X-Tole-Delivery", id),
+                ("X-Tole-Event", event),
+                ("X-Tole-Signature", &sig),
+            ],
+            &body,
+        )
+        .await
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Two writes in one request, so the resumed turn raises a second approval.
+const TWO_WRITES: &str = "please WRITE first.md ALSO second.md now";
+
+#[tokio::test]
+#[ignore = "needs TOLE_BIN"]
+async fn webhook_events_carry_a_whole_two_approval_flow_without_polling() {
+    // The gateway's fallback poll is 10 minutes: everything below that shows
+    // up within the 40 s waits can only have come from tole's events.
+    let rig = Rig::start_with(Some(Hooks::EVENTS)).await;
+    let hub = rig.hub.clone().unwrap();
+
+    rig.say(TWO_WRITES);
+    // The first approval comes back in the prompt answer itself.
+    rig.wait_text("the first approval", |t| {
+        t.contains("write_file") && t.contains("first.md")
+    })
+    .await;
+    let first_button = rig.button(0);
+    rig.press(0);
+
+    // (1) The approval the resumed turn raises arrives as `approval_requested`.
+    let second = rig
+        .wait_text("the second approval", |t| {
+            t.contains("write_file") && t.contains("second.md")
+        })
+        .await;
+    assert!(second.contains("second.md"), "{second}");
+    assert!(rig.workspace_file("first.md").exists());
+    assert!(!rig.workspace_file("second.md").exists());
+    assert!(
+        rig.button(0) != first_button,
+        "the buttons belong to the new approval"
+    );
+
+    // (2) After the second Allow, `turn_finished` ends the wait.
+    rig.tg
+        .push_callback(OWNER, OWNER, "cb-2", &rig.button(0), 1001);
+    rig.wait_text("the final answer", |t| t == "done: second.md")
+        .await;
+    assert_eq!(
+        std::fs::read_to_string(rig.workspace_file("second.md")).unwrap(),
+        WRITE_CONTENT
+    );
+
+    // The gateway's hub holds what tole sent, so the receiver really took it.
+    let sid = rig.only_session();
+    let turn = hub.latest_turn(&sid).expect("a turn_finished was received");
+    assert_eq!(turn.status, TurnStatus::Completed);
+    let approvals = rig.client.approvals(Some(&sid)).await.unwrap();
+    assert_eq!(approvals.len(), 2, "{approvals:?}");
+    until("approval_resolved for both approvals", || {
+        approvals.iter().all(|a| hub.is_resolved(&a.id))
+    })
+    .await;
+    assert!(
+        hub.take_requested(&sid, &[], u64::MAX / 2000).is_none(),
+        "every announced approval was shown, none is left over"
+    );
+    // Each message reached the chat once.
+    let texts = rig.texts();
+    assert_eq!(texts.iter().filter(|t| *t == "done: second.md").count(), 1);
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|t| t.contains("second.md") && t.contains("write_file"))
+            .count(),
+        1,
+        "the second approval was shown once: {texts:?}"
+    );
+    rig.assert_no_secrets();
+}
+
+#[tokio::test]
+#[ignore = "needs TOLE_BIN"]
+async fn webhook_forged_and_stale_deliveries_are_dropped_while_the_real_flow_runs() {
+    let rig = Rig::start_with(Some(Hooks::EVENTS)).await;
+    let hub = rig.hub.clone().unwrap();
+    rig.say(TWO_WRITES);
+    rig.wait_text("the first approval", |t| {
+        t.contains("write_file") && t.contains("first.md")
+    })
+    .await;
+    let sid = rig.only_session();
+    let now = now_secs();
+    let announce = json!({"source": "serve", "approval_id": "apr-forged-1", "session_id": sid,
+        "tool": "write_file", "risk": "write", "summary": "FORGED write_file evil.md",
+        "created_at": now, "expires_at": now + 900});
+    let finish = json!({"session_id": sid, "status": "completed", "last_seq": 999_999});
+    let forged_turn_id = format!("turn:{sid}:0123456789abcdef:999999");
+
+    // A wrong key, for an approval and for a turn end.
+    for (event, id, data) in [
+        (
+            "approval_requested",
+            "approval:apr-forged-1:requested",
+            announce.clone(),
+        ),
+        ("turn_finished", forged_turn_id.as_str(), finish.clone()),
+    ] {
+        let (status, body) = rig
+            .deliver("not-the-e2e-webhook-key-0000000000", now, event, id, data)
+            .await;
+        assert_eq!(
+            (status, body.as_str()),
+            (401, ""),
+            "{event} with a wrong key"
+        );
+    }
+    // The right key but a timestamp outside the 300 second window: what a
+    // replay of a captured request looks like once it is stale.
+    let (status, body) = rig
+        .deliver(
+            WEBHOOK_KEY,
+            now - 1000,
+            "approval_requested",
+            "approval:apr-forged-2:requested",
+            announce.clone(),
+        )
+        .await;
+    assert_eq!((status, body.as_str()), (401, ""), "a stale replay");
+    // No signature headers at all, and a tampered body under a real signature.
+    let (status, body) = rig.post_hook(&[], "{}").await;
+    assert_eq!((status, body.as_str()), (401, ""), "no headers");
+    let ts = now.to_string();
+    let good = json!({"v": 1, "id": "approval:apr-x:requested", "type": "approval_requested",
+        "destination": "gateway", "at": now, "data": announce})
+    .to_string();
+    let sig = sign(
+        &Secret::new(WEBHOOK_KEY),
+        &ts,
+        "approval:apr-x:requested",
+        "approval_requested",
+        good.as_bytes(),
+    );
+    let (status, body) = rig
+        .post_hook(
+            &[
+                ("X-Tole-Timestamp", &ts),
+                ("X-Tole-Delivery", "approval:apr-x:requested"),
+                ("X-Tole-Event", "approval_requested"),
+                ("X-Tole-Signature", &sig),
+            ],
+            &good.replace("evil.md", "evil2.md"),
+        )
+        .await;
+    assert_eq!((status, body.as_str()), (401, ""), "a tampered body");
+
+    // The real flow is unaffected and shows only real approvals.
+    rig.press(0);
+    rig.wait_text("the second approval", |t| {
+        t.contains("write_file") && t.contains("second.md")
+    })
+    .await;
+    rig.tg
+        .push_callback(OWNER, OWNER, "cb-2", &rig.button(0), 1001);
+    rig.wait_text("the final answer", |t| t == "done: second.md")
+        .await;
+    let turn = hub
+        .latest_turn(&sid)
+        .expect("the real turn_finished arrived");
+    assert_eq!(turn.status, TurnStatus::Completed);
+    assert!(turn.last_seq < 999_999, "the forged turn end was not kept");
+    assert!(!hub.is_resolved("apr-forged-1"));
+    for t in rig.texts() {
+        assert!(!t.contains("FORGED") && !t.contains("evil"), "{t}");
+    }
+    assert_eq!(
+        rig.tg
+            .sent_messages()
+            .iter()
+            .filter(|m| m["reply_markup"]["inline_keyboard"].is_array())
+            .count(),
+        2,
+        "exactly the two real approvals were offered"
+    );
+    assert!(!rig.workspace_file("evil.md").exists());
+    rig.assert_no_secrets();
+}
+
+#[tokio::test]
+#[ignore = "needs TOLE_BIN"]
+async fn webhook_receiver_off_polling_still_completes() {
+    // tole still has the destination (its deliveries find a closed port); the
+    // gateway runs without a receiver, as before the feature.
+    let rig = Rig::start_with(Some(Hooks {
+        receiver: false,
+        ..Hooks::EVENTS
+    }))
+    .await;
+    assert!(rig.hub.is_none());
+    rig.say(TWO_WRITES);
+    rig.wait_text("the first approval", |t| {
+        t.contains("write_file") && t.contains("first.md")
+    })
+    .await;
+    rig.press(0);
+    rig.wait_text("the second approval", |t| {
+        t.contains("write_file") && t.contains("second.md")
+    })
+    .await;
+    rig.tg
+        .push_callback(OWNER, OWNER, "cb-2", &rig.button(0), 1001);
+    rig.wait_text("the final answer", |t| t == "done: second.md")
+        .await;
+    assert!(rig.workspace_file("second.md").exists());
+    rig.assert_no_secrets();
+}
+
+#[tokio::test]
+#[ignore = "needs TOLE_BIN"]
+async fn webhook_without_turn_finished_the_fallback_poll_answers() {
+    // The receiver is on but tole is not told to send `turn_finished`: the
+    // answer after an Allow comes from the fallback poll (every second here).
+    let rig = Rig::start_with(Some(Hooks {
+        events: r#"["approval_requested", "approval_resolved"]"#,
+        fallback_secs: 1,
+        ..Hooks::EVENTS
+    }))
+    .await;
+    let hub = rig.hub.clone().unwrap();
+    rig.say("please WRITE notes.md now");
+    rig.wait_text("the approval", |t| t.contains("write_file"))
+        .await;
+    rig.press(0);
+    rig.wait_text("the final answer", |t| t == "done: notes.md")
+        .await;
+    // The receiver works (the resolution arrives); no turn end was sent.
+    let sid = rig.only_session();
+    let approvals = rig.client.approvals(Some(&sid)).await.unwrap();
+    until("approval_resolved", || {
+        approvals.iter().all(|a| hub.is_resolved(&a.id))
+    })
+    .await;
+    assert!(hub.latest_turn(&sid).is_none());
     rig.assert_no_secrets();
 }
 
